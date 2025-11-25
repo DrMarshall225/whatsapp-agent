@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  whatsapp-agent:
+    build:
+      context: .
+    container_name: whatsapp-agent
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+
+      DB_HOST: "65.109.27.58"
+      DB_PORT: "55432"
+      DB_USER: "postgres"
+      DB_PASSWORD: "ayYtneAT6CuKks"
+      DB_NAME: "whatsapp_agent"
+
+      # TA clé waHA en clair (la même que tu utilises dans Swagger)
+      WAHA_BASE_URL: "http://srv853938.hstgr.cloud:3001"
+      WAHA_API_KEY_PLAIN: "BekoWahaKey_2025_Abidjan_9xPqL7vT2"
+      WAHA_SESSION: "default"
+
+      N8N_COMMAND_BOT_URL: "https://n8n.srv853938.hstgr.cloud/webhook/commandBot"
+
+    ports:
+      - "3002:3000"   # <- PORT PUBLIC 3002 sur le VPS -> port 3000 dans le container
