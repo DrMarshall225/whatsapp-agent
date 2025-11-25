@@ -36,6 +36,10 @@ import { sendWhatsappMessage } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 
 // Webhook WhatsApp
+app.get("/", (req, res) => {
+  res.send("whatsapp-agent OK");
+});
+
 app.post("/webhook/whatsapp", async (req, res) => {
   try {
     const { from, to, text } = mapWhatsappPayload(req.body);
