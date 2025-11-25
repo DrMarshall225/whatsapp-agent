@@ -1,3 +1,7 @@
+app.get("/", (req, res) => {
+  res.send("whatsapp-agent OK");
+});
+
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 
@@ -36,9 +40,6 @@ import { sendWhatsappMessage } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 
 // Webhook WhatsApp
-app.get("/", (req, res) => {
-  res.send("whatsapp-agent OK");
-});
 
 app.post("/webhook/whatsapp", async (req, res) => {
   try {
