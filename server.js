@@ -54,18 +54,32 @@ function mapWhatsappPayload(body) {
   };
 }
 
-function chatIdToPhone(chatId) {
-  // ex: "2250700000000@c.us" -> "+2250700000000"
-  if (!chatId) return null;
-  const digits = String(chatId).split("@")[0].replace(/[^\d]/g, "");
+function normalizeWahaIdToPhone(id) {
+  // ex: "2250700000000@c.us" / "2250700000000@s.whatsapp.net" / "+2250700000000"
+  if (!id) return null;
+  const cleaned = String(id)
+    .replace("@c.us", "")
+    .replace("@s.whatsapp.net", "")
+    .trim();
+
+  const digits = cleaned.replace(/[^\d]/g, "");
   return digits ? `+${digits}` : null;
+}
+
+function shorten(obj, max = 1400) {
+  try {
+    const s = JSON.stringify(obj);
+    return s.length > max ? s.slice(0, max) + "..." : s;
+  } catch {
+    return String(obj);
+  }
 }
 
 // ================================
 // Moteur commun (WhatsApp test + WAHA)
 // ================================
-async function handleIncomingMessage({ from, to, text }) {
-  console.log("Message reçu", { from, to, text });
+async function handleIncomingMessage({ from, to, text, session = "default" }) {
+  console.log("Message reçu", { session, from, to, text });
 
   const merchant = await findMerchantByWhatsappNumber(to);
   if (!merchant) {
@@ -193,43 +207,52 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
 // ================================
 // Webhook WAHA (production)
+// - accepte "message", "message.any", etc.
+// - répond 200 immédiatement (important)
 // ================================
 app.post("/webhook/waha", async (req, res) => {
+  // répondre vite à WAHA
+  res.sendStatus(200);
+
   try {
-    console.log("✅ WAHA webhook appelé !");
-    // console.log(JSON.stringify(req.body, null, 2));
+    console.log("✅ [WAHA] webhook reçu:", shorten(req.body));
 
-    const evt = req.body || {};
-    const payload = evt.payload || evt.data || evt.message;
+    const event = String(req.body?.event || req.body?.type || "").toLowerCase();
+    if (!event.startsWith("message")) return;
 
-    // On accepte uniquement les messages
-    if ((evt.event || evt.type) !== "message" || !payload) {
-      return res.sendStatus(200);
-    }
+    const payload = req.body?.payload || req.body?.data || req.body?.message || {};
+    if (!payload || typeof payload !== "object") return;
 
     // éviter les boucles (messages envoyés par toi-même)
-    if (payload.fromMe === true) return res.sendStatus(200);
+    if (payload.fromMe === true) return;
 
-    const from = chatIdToPhone(payload.from || payload.author || payload.chatId);
-    const to = chatIdToPhone(payload.to || payload.recipient || payload.toId);
+    const session = req.body?.session || "default";
+
+    const from =
+      normalizeWahaIdToPhone(payload.from) ||
+      normalizeWahaIdToPhone(payload.author) ||
+      normalizeWahaIdToPhone(payload.chatId);
+
+    const to =
+      normalizeWahaIdToPhone(payload.to) ||
+      normalizeWahaIdToPhone(req.body?.me?.id); // parfois WAHA fournit me.id
 
     const text =
       payload.body ||
       payload.text ||
       payload.message ||
+      payload.caption ||
       (payload._data && payload._data.body) ||
       "";
 
-    if (!from || !to || !text) {
-      console.warn("[WAHA] Champs manquants, ignoré", { from, to, text });
-      return res.sendStatus(200);
+    if (!from || !text) {
+      console.warn("[WAHA] Champs manquants (from/text). Ignoré.", { from, to, text });
+      return;
     }
 
-    await handleIncomingMessage({ from, to, text });
-    return res.sendStatus(200);
+    await handleIncomingMessage({ from, to, text, session });
   } catch (e) {
-    console.error("Erreur /webhook/waha", e);
-    return res.sendStatus(200);
+    console.error("❌ Erreur /webhook/waha", e);
   }
 });
 
@@ -254,6 +277,15 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function enforceSameMerchant(req, res, merchantId) {
+  if (!req.merchantId) return false;
+  if (Number(merchantId) !== Number(req.merchantId)) {
+    res.status(403).json({ error: "Accès refusé (merchantId ne correspond pas au token)." });
+    return false;
+  }
+  return true;
+}
+
 // ================================
 // API Catalogue + Commandes
 // ================================
@@ -261,6 +293,7 @@ app.get("/api/merchants/:merchantId/products", authMiddleware, async (req, res) 
   try {
     const merchantId = Number(req.params.merchantId);
     if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+    if (!enforceSameMerchant(req, res, merchantId)) return;
 
     const products = await getProductsForMerchant(merchantId);
     return res.json(products);
@@ -274,6 +307,7 @@ app.post("/api/merchants/:merchantId/products", authMiddleware, async (req, res)
   try {
     const merchantId = Number(req.params.merchantId);
     if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+    if (!enforceSameMerchant(req, res, merchantId)) return;
 
     const { name, price, description, currency, code, category, image_url } = req.body;
 
@@ -306,6 +340,7 @@ app.put("/api/merchants/:merchantId/products/:productId", authMiddleware, async 
     if (Number.isNaN(merchantId) || Number.isNaN(productId)) {
       return res.status(400).json({ error: "merchantId ou productId invalide" });
     }
+    if (!enforceSameMerchant(req, res, merchantId)) return;
 
     const { name, price, description, currency, code, category, image_url, is_active } = req.body;
 
@@ -340,6 +375,7 @@ app.delete("/api/merchants/:merchantId/products/:productId", authMiddleware, asy
     if (Number.isNaN(merchantId) || Number.isNaN(productId)) {
       return res.status(400).json({ error: "merchantId ou productId invalide" });
     }
+    if (!enforceSameMerchant(req, res, merchantId)) return;
 
     await deleteProductForMerchant(merchantId, productId);
     return res.status(204).send();
@@ -353,6 +389,7 @@ app.get("/api/merchants/:merchantId/orders", authMiddleware, async (req, res) =>
   try {
     const merchantId = Number(req.params.merchantId);
     if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+    if (!enforceSameMerchant(req, res, merchantId)) return;
 
     const orders = await getOrdersForMerchant(merchantId);
     return res.json(orders);
@@ -370,6 +407,7 @@ app.get("/api/merchants/:merchantId/orders/:orderId", authMiddleware, async (req
     if (Number.isNaN(merchantId) || Number.isNaN(orderId)) {
       return res.status(400).json({ error: "merchantId ou orderId invalide" });
     }
+    if (!enforceSameMerchant(req, res, merchantId)) return;
 
     const data = await getOrderWithItems(merchantId, orderId);
     if (!data) return res.status(404).json({ error: "Commande introuvable" });
@@ -390,6 +428,7 @@ app.put("/api/merchants/:merchantId/orders/:orderId/status", authMiddleware, asy
     if (Number.isNaN(merchantId) || Number.isNaN(orderId)) {
       return res.status(400).json({ error: "merchantId ou orderId invalide" });
     }
+    if (!enforceSameMerchant(req, res, merchantId)) return;
     if (!status) return res.status(400).json({ error: "Le champ 'status' est obligatoire." });
 
     const updated = await updateOrderStatus(merchantId, orderId, status);
