@@ -1,7 +1,3 @@
-app.get("/", (req, res) => {
-  res.send("whatsapp-agent OK");
-});
-
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 
@@ -13,6 +9,10 @@ import bodyParser from "body-parser";
 const app = express();
 app.use(cors());          // ← autorise les appels depuis le front
 app.use(bodyParser.json());
+app.get("/", (req, res) => {
+  res.status(200).send("whatsapp-agent OK ✅");
+});
+
 import {
   findMerchantByWhatsappNumber,
   findOrCreateCustomer,
