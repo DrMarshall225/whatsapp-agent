@@ -16,7 +16,8 @@ services:
       DB_NAME: "whatsapp_agent"
 
       # TA clé waHA en clair (la même que tu utilises dans Swagger)
-      WAHA_BASE_URL: "http://srv853938.hstgr.cloud:3001"
+     # WAHA_BASE_URL: "http://srv853938.hstgr.cloud:3001"
+      WAHA_BASE_URL="http://waha:3000"
       WAHA_API_KEY_PLAIN: "BekoWahaKey_2025_Abidjan_9xPqL7vT2"
       WAHA_SESSION: "default"
 
@@ -24,3 +25,12 @@ services:
 
     ports:
       - "3002:3000"   # <- PORT PUBLIC 3002 sur le VPS -> port 3000 dans le container
+
+ networks:
+      - appnet
+      - default
+
+networks:
+  appnet:
+    external: true
+    name: appnet
