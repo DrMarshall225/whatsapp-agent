@@ -54,10 +54,17 @@ function mapWhatsappPayload(body) {
   };
 }
 
+
 function chatIdToPhone(chatId) {
   // ex: "2250700000000@c.us" -> "+2250700000000"
   if (!chatId) return null;
   const digits = String(chatId).split("@")[0].replace(/[^\d]/g, "");
+  return digits ? `+${digits}` : null;
+}
+
+function normalizePhone(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/[^\d]/g, "");
   return digits ? `+${digits}` : null;
 }
 
@@ -81,7 +88,10 @@ function pickBusinessNumberFromPayload(payload) {
 async function handleIncomingMessage({ from, to, text }) {
   console.log("Message reçu", { from, to, text });
 
-  const merchant = await findMerchantByWhatsappNumber(to);
+  console.log("[DEBUG] to raw =", to, "to normalized =", normalizePhone(to));
+
+  const merchant = await findMerchantByWhatsappNumber(normalizePhone(to));
+
   if (!merchant) {
     console.warn("Aucun marchand pour ce numéro", to);
     return { message: null, actions: [] };
