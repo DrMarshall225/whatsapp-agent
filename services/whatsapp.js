@@ -1,39 +1,25 @@
-// services/whatsapp.js
+export async function sendWhatsappMessage({ to, text }) {
+  const baseUrl = process.env.WAHA_BASE_URL;      // ex: http://waha:3000
+  const apiKey = process.env.WAHA_API_KEY;
+  const session = process.env.WAHA_SESSION || "default";
 
-// Version simple : en dev on LOG juste le message.
-// Tu peux ensuite décommenter la partie "appel API" plus bas pour l’intégrer à WAHA ou autre.
+  const chatId = String(to).replace(/[^\d]/g, "") + "@c.us"; // "+22507..." => "22507...@c.us"
 
-export async function sendWhatsappMessage({ to, from, text }) {
-  console.log("✅ [sendWhatsappMessage] Message à envoyer :", { to, from, text });
+  const url = `${baseUrl}/api/sendText`;
 
-  // 👉 Ici, en DEV, on ne fait rien d'autre.
-  // Si tu veux vraiment appeler ton gateway WhatsApp (WAHA, Cloud API, etc.),
-  // adapte l’exemple ci-dessous :
-
-  /*
-  const WAHA_API_URL = process.env.WAHA_API_URL || "http://localhost:3000/api/sendMessage";
-  const WAHA_API_TOKEN = process.env.WAHA_API_TOKEN || "TON_TOKEN";
-
-  const response = await fetch(WAHA_API_URL, {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${WAHA_API_TOKEN}`,
+      "X-API-KEY": apiKey,
     },
-    body: JSON.stringify({
-      to,
-      from,
-      text,
-      // adapte selon le format attendu par ton provider
-    }),
+    body: JSON.stringify({ session, chatId, text }),
   });
 
-  if (!response.ok) {
-    const body = await response.text();
-    console.error("❌ Erreur en envoyant le message WhatsApp :", body);
-    throw new Error("Erreur d'envoi WhatsApp");
-  }
-  */
+  const body = await res.text();
+  console.log("[WAHA sendText] status=", res.status, "body=", body);
 
-  return true;
+  if (!res.ok) {
+    throw new Error(`WAHA sendText failed: ${res.status} ${body}`);
+  }
 }
