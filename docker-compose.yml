@@ -1,10 +1,11 @@
+version: "3.8"
+
 services:
   whatsapp-agent:
     build:
       context: .
     container_name: whatsapp-agent
     restart: unless-stopped
-
     environment:
       PORT: "3000"
 
@@ -14,7 +15,7 @@ services:
       DB_PASSWORD: "ayYtneAT6CuKks"
       DB_NAME: "whatsapp_agent"
 
-      # WAHA accessible via le nom du container dans le même network docker
+      # IMPORTANT: appeler WAHA via le réseau docker
       WAHA_BASE_URL: "http://waha:3000"
       WAHA_API_KEY: "BekoWahaKey_2025_Abidjan_9xPqL7vT2"
       WAHA_SESSION: "default"
@@ -23,7 +24,6 @@ services:
 
     ports:
       - "3002:3000"
-
     networks:
       - appnet
 
