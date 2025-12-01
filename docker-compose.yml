@@ -4,6 +4,7 @@ services:
       context: .
     container_name: whatsapp-agent
     restart: unless-stopped
+
     environment:
       PORT: "3000"
 
@@ -13,12 +14,12 @@ services:
       DB_PASSWORD: "ayYtneAT6CuKks"
       DB_NAME: "whatsapp_agent"
 
-      # WAHA interne (même docker network)
+      # WAHA accessible via le nom du container dans le même network docker
       WAHA_BASE_URL: "http://waha:3000"
       WAHA_API_KEY: "BekoWahaKey_2025_Abidjan_9xPqL7vT2"
       WAHA_SESSION: "default"
 
-      N8N_COMMAND_BOT_URL: "https://n8n.srv853938.cloud/webhook/commandBot"
+      N8N_COMMAND_BOT_URL: "https://n8n.srv853938.hstgr.cloud/webhook/commandBot"
 
     ports:
       - "3002:3000"
