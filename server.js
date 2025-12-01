@@ -61,6 +61,20 @@ function chatIdToPhone(chatId) {
   return digits ? `+${digits}` : null;
 }
 
+/**
+ * WAHA peut envoyer des payloads différents selon l’event/version.
+ * Ici on tente plusieurs champs possibles pour récupérer le numéro "business" (to).
+ */
+function pickBusinessNumberFromPayload(payload) {
+  return (
+    chatIdToPhone(payload?.to) ||
+    chatIdToPhone(payload?.recipient) ||
+    chatIdToPhone(payload?.chatId) ||
+    chatIdToPhone(payload?.id?.remote) ||
+    null
+  );
+}
+
 // ================================
 // Moteur commun (WhatsApp test + WAHA)
 // ================================
@@ -183,7 +197,10 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    await handleIncomingMessage({ from, to, text });
+    const cleanText = String(text || "").trim();
+    if (!cleanText) return res.sendStatus(200);
+
+    await handleIncomingMessage({ from, to, text: cleanText });
     return res.sendStatus(200);
   } catch (e) {
     console.error("Erreur webhook /webhook/whatsapp", e);
@@ -193,29 +210,33 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
 // ================================
 // Webhook WAHA (production)
-// Format WAHA doc: { event, session, payload } 
+// Format WAHA doc: { event, session, payload }
 // ================================
 app.post("/webhook/waha", async (req, res) => {
   try {
-    const evt = req.body || {};
-   console.log("📩 WAHA webhook reçu :", JSON.stringify(req.body, null, 2));
+    console.log("📩 WAHA webhook reçu :", JSON.stringify(req.body, null, 2));
 
-    const eventName = evt.event || evt.type || "";
+    const evt = req.body || {};
+    const eventName = String(evt.event || evt.type || "");
     const payload = evt.payload || evt.data || evt.message;
 
-    // on accepte message + message.any + etc si tu veux
-    if (!eventName.startsWith("message") || !payload) {
+    // Certains WAHA envoient "message.any", "message", "message.upsert", etc.
+    // On accepte tout ce qui contient "message"
+    if (!payload || !eventName.includes("message")) {
       return res.sendStatus(200);
     }
 
-    // anti-boucle: ignorer les messages envoyés par le compte WAHA lui-même
+    // Anti-boucle: ignorer les messages envoyés par le compte WAHA lui-même
     if (payload.fromMe === true) {
       return res.sendStatus(200);
     }
 
     const from = chatIdToPhone(payload.from);
-    const to = chatIdToPhone(payload.to);
-    const text = payload.body || payload.text || payload.message || "";
+
+    // IMPORTANT: "to" peut être manquant selon l'event -> on tente plusieurs champs.
+    const to = pickBusinessNumberFromPayload(payload) || chatIdToPhone(payload.to);
+
+    const text = (payload.body || payload.text || payload.message || "").trim();
 
     if (!from || !to || !text) {
       console.warn("[WAHA] Champs manquants, ignoré", { from, to, text });
