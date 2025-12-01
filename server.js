@@ -34,7 +34,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json({ limit: "2mb" }));
+app.use(bodyParser.json({ limit: "5mb" }));
 
 // ================================
 // Test simple
@@ -198,7 +198,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
 app.post("/webhook/waha", async (req, res) => {
   try {
     const evt = req.body || {};
-    console.log("[WAHA] webhook reçu:", JSON.stringify(evt));
+   console.log("📩 WAHA webhook reçu :", JSON.stringify(req.body, null, 2));
 
     const eventName = evt.event || evt.type || "";
     const payload = evt.payload || evt.data || evt.message;
