@@ -1,32 +1,82 @@
 // services/store.pg.js
 import { query } from "../db.js";
 
-/**
- * Trouver le marchand à partir de son numéro WhatsApp (numéro "to")
- */
-export async function createMerchant({ name, email, passwordHash, whatsappNumber }) {
-  const res = await query(
-    `
-    INSERT INTO merchants (name, email, password_hash, whatsapp_number)
-    VALUES ($1, $2, $3, $4)
-    RETURNING id, name, email;
-    `,
-    [name, email, passwordHash, whatsappNumber]
-  );
-  return res.rows[0];
+
+function normalizeE164(input) {
+  if (!input) return null;
+  const digits = String(input).replace(/[^\d]/g, "");
+  return digits ? `+${digits}` : null;
 }
 
-export async function findMerchantByWhatsappNumber(whatsappNumber) {
- //console.log("👉 findMerchantByWhatsappNumber()", whatsappNumber);
-    const sql = `
-    SELECT *
-    FROM merchants
-    WHERE whatsapp_number = $1
-    LIMIT 1
-  `;
-  const result = await query(sql, [whatsappNumber]);
-  return result.rows[0] || null;
+function normalizeSession(input) {
+  if (!input) return null;
+  // ex: "Ferme DEM" -> "ferme_dem"
+  return String(input)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^\w]/g, "");
 }
+
+export async function findMerchantByWahaSession(session) {
+  const s = normalizeSession(session);
+  if (!s) return null;
+
+  const { rows } = await db.query(
+    `SELECT * FROM merchants WHERE waha_session = $1 LIMIT 1`,
+    [s]
+  );
+  return rows[0] || null;
+}
+
+export async function findMerchantByWhatsappNumberE164(whatsappNumber) {
+  const n = normalizeE164(whatsappNumber);
+  if (!n) return null;
+
+  const { rows } = await db.query(
+    `SELECT * FROM merchants WHERE whatsapp_number = $1 LIMIT 1`,
+    [n]
+  );
+  return rows[0] || null;
+}
+
+export async function createMerchantWithWaha({
+  name,
+  email,
+  passwordHash,
+  whatsappNumber,
+  wahaSession,
+}) {
+  const n = normalizeE164(whatsappNumber);
+  const s = normalizeSession(wahaSession);
+
+  const { rows } = await db.query(
+    `INSERT INTO merchants (name, email, password_hash, whatsapp_number, waha_session)
+     VALUES ($1,$2,$3,$4,$5)
+     RETURNING id, name, email, whatsapp_number, waha_session`,
+    [name, email, passwordHash, n, s]
+  );
+  return rows[0];
+}
+
+export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wahaSession }) {
+  const id = Number(merchantId);
+  const n = normalizeE164(whatsappNumber);
+  const s = normalizeSession(wahaSession);
+
+  const { rows } = await db.query(
+    `UPDATE merchants
+     SET whatsapp_number = COALESCE($2, whatsapp_number),
+         waha_session    = COALESCE($3, waha_session)
+     WHERE id = $1
+     RETURNING id, name, email, whatsapp_number, waha_session`,
+    [id, n, s]
+  );
+  return rows[0] || null;
+}
+
+export { normalizeE164, normalizeSession };
+
 
 /**
  * Trouver ou créer un client pour un marchand donné
