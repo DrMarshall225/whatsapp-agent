@@ -5,6 +5,7 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 
 import {
+  findMerchantByWahaSession,
   findMerchantByWhatsappNumber,
   findOrCreateCustomer,
   getCart,
@@ -24,6 +25,8 @@ import {
   updateOrderStatus,
   findMerchantByEmail,
   createMerchant,
+  createMerchantWithWaha,
+  updateMerchantWahaConfig,
 } from "./services/store.pg.js";
 
 import { callCommandBot } from "./services/commandbot.js";
@@ -35,6 +38,49 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "5mb" }));
+
+
+function adminMiddleware(req, res, next) {
+  const key = req.headers["x-admin-key"];
+  if (!process.env.ADMIN_KEY) {
+    return res.status(500).json({ error: "ADMIN_KEY non configuré côté serveur" });
+  }
+  if (key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: "Admin key invalide" });
+  }
+  next();
+}
+
+
+
+app.put("/api/admin/merchants/:merchantId/waha", adminMiddleware, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+
+    const { whatsapp_number, waha_session } = req.body || {};
+    if (!whatsapp_number && !waha_session) {
+      return res.status(400).json({ error: "Fournis whatsapp_number et/ou waha_session" });
+    }
+
+    const updated = await updateMerchantWahaConfig(merchantId, {
+      whatsappNumber: whatsapp_number,
+      wahaSession: waha_session,
+    });
+
+    if (!updated) return res.status(404).json({ error: "Marchand introuvable" });
+
+    return res.json({ merchant: updated });
+  } catch (e) {
+    console.error("Erreur PUT /api/admin/merchants/:id/waha", e);
+    if (e.code === "23505") {
+      return res.status(400).json({ error: "whatsapp_number ou waha_session déjà pris", details: e.detail });
+    }
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+
 
 // ================================
 // Test simple
@@ -85,58 +131,41 @@ function pickBusinessNumberFromPayload(payload) {
 // ================================
 // Moteur commun (WhatsApp test + WAHA)
 // ================================
-async function handleIncomingMessage({ from, to, text }) {
-  console.log("Message reçu", { from, to, text });
-
-  console.log("[DEBUG] to raw =", to, "to normalized =", normalizePhone(to));
-
-  const merchant = await findMerchantByWhatsappNumber(normalizePhone(to));
-
-  if (!merchant) {
-    console.warn("Aucun marchand pour ce numéro", to);
-    return { message: null, actions: [] };
-  }
+async function handleIncomingMessage({ from, text, merchant }) {
+  console.log("Message reçu", { from, merchantId: merchant?.id, text });
 
   const customer = await findOrCreateCustomer(merchant.id, from);
   const cart = await getCart(merchant.id, customer.id);
   const products = await getProductsForMerchant(merchant.id);
   const conversationState = await getConversationState(merchant.id, customer.id);
 
-  const agentInput = {
+  const agentOutput = await callCommandBot({
     message: text,
     merchant: { id: merchant.id, name: merchant.name },
-    customer: {
-      id: customer.id,
-      phone: customer.phone,
-      name: customer.name,
-      known_fields: {
-        address: customer.address,
-        payment_method: customer.payment_method,
-      },
-    },
+    customer: { id: customer.id, phone: customer.phone, name: customer.name, known_fields: {
+      address: customer.address,
+      payment_method: customer.payment_method,
+    }},
     cart,
     products,
     conversation_state: conversationState,
-  };
-
-  const agentOutput = await callCommandBot(agentInput);
+  });
 
   if (Array.isArray(agentOutput?.actions)) {
-    for (const action of agentOutput.actions) {
-      await applyAction(action, { merchant, customer });
-    }
+    for (const action of agentOutput.actions) await applyAction(action, { merchant, customer });
   }
 
   if (agentOutput?.message) {
     await sendWhatsappMessage({
+      merchant,          // <<< clé du multi-marchands
       to: from,
-      from: to,
       text: agentOutput.message,
     });
   }
 
   return agentOutput || { message: null, actions: [] };
 }
+
 
 // ================================
 // Actions IA
@@ -222,44 +251,45 @@ app.post("/webhook/whatsapp", async (req, res) => {
 // Webhook WAHA (production)
 // Format WAHA doc: { event, session, payload }
 // ================================
+
 app.post("/webhook/waha", async (req, res) => {
   try {
-    console.log("📩 WAHA webhook reçu :", JSON.stringify(req.body, null, 2));
-
     const evt = req.body || {};
-    const eventName = String(evt.event || evt.type || "");
+    const eventName = evt.event || evt.type || "";
     const payload = evt.payload || evt.data || evt.message;
 
-    // Certains WAHA envoient "message.any", "message", "message.upsert", etc.
-    // On accepte tout ce qui contient "message"
-    if (!payload || !eventName.includes("message")) {
-      return res.sendStatus(200);
+    if (!eventName.startsWith("message") || !payload) return res.sendStatus(200);
+    if (payload.fromMe === true) return res.sendStatus(200);
+
+    // ignore groups + status
+    if (String(payload.from || "").includes("@g.us")) return res.sendStatus(200);
+    if (String(payload.from || "") === "status@broadcast") return res.sendStatus(200);
+
+    // ROUTING
+    let merchant = evt.session ? await findMerchantByWahaSession(evt.session) : null;
+
+    if (!merchant) {
+      const toE164 = chatIdToPhone(evt?.me?.id || payload.to);
+      merchant = await findMerchantByWhatsappNumberE164(toE164);
     }
 
-    // Anti-boucle: ignorer les messages envoyés par le compte WAHA lui-même
-    if (payload.fromMe === true) {
-      return res.sendStatus(200);
-    }
+    if (!merchant) return res.sendStatus(200);
 
-    const from = chatIdToPhone(payload.from);
+    const from = chatIdToPhone(payload.from || payload.participant);
+    const text = payload.body || payload.text || payload.message || payload.caption || "";
+    if (!from || !text) return res.sendStatus(200);
 
-    // IMPORTANT: "to" peut être manquant selon l'event -> on tente plusieurs champs.
-    const to = pickBusinessNumberFromPayload(payload) || chatIdToPhone(payload.to);
+    // IMPORTANT: on passe merchant pour que la réponse utilise merchant.waha_session
+    await handleIncomingMessage({ from, text, merchant });
 
-    const text = (payload.body || payload.text || payload.message || "").trim();
-
-    if (!from || !to || !text) {
-      console.warn("[WAHA] Champs manquants, ignoré", { from, to, text });
-      return res.sendStatus(200);
-    }
-
-    await handleIncomingMessage({ from, to, text });
     return res.sendStatus(200);
   } catch (e) {
     console.error("Erreur /webhook/waha", e);
     return res.sendStatus(200);
   }
 });
+
+
 
 // ================================
 // Auth middleware
@@ -501,6 +531,51 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
+
+import { createMerchantWithWaha } from "./services/store.pg.js";
+
+app.post("/api/admin/merchants", adminMiddleware, async (req, res) => {
+  try {
+    const { name, email, password, whatsapp_number, waha_session } = req.body || {};
+
+    if (!name || !email || !password || !whatsapp_number || !waha_session) {
+      return res.status(400).json({
+        error: "Champs requis: name, email, password, whatsapp_number, waha_session",
+      });
+    }
+
+    const existing = await findMerchantByEmail(email);
+    if (existing) return res.status(400).json({ error: "Cet email est déjà utilisé." });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    let merchant;
+    try {
+      merchant = await createMerchantWithWaha({
+        name,
+        email,
+        passwordHash,
+        whatsappNumber: whatsapp_number,
+        wahaSession: waha_session,
+      });
+    } catch (e) {
+      // 23505 = unique violation (email/whatsapp_number/waha_session)
+      if (e.code === "23505") {
+        return res.status(400).json({
+          error: "Collision: email ou whatsapp_number ou waha_session déjà utilisé.",
+          details: e.detail,
+        });
+      }
+      throw e;
+    }
+
+    return res.status(201).json({ merchant });
+  } catch (e) {
+    console.error("Erreur POST /api/admin/merchants", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
 
 // ================================
 // Start server (TOUJOURS à la fin)
