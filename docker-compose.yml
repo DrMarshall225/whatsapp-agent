@@ -15,12 +15,15 @@ services:
       DB_PASSWORD: "ayYtneAT6CuKks"
       DB_NAME: "whatsapp_agent"
 
-      # IMPORTANT: appeler WAHA via le réseau docker
+      # Appeler WAHA via le réseau docker (service name = waha)
       WAHA_BASE_URL: "http://waha:3000"
       WAHA_API_KEY: "BekoWahaKey_2025_Abidjan_9xPqL7vT2"
-      WAHA_SESSION: "default"
 
+      # URL n8n
       N8N_COMMAND_BOT_URL: "https://n8n.srv853938.hstgr.cloud/webhook/commandBot"
+
+      # (optionnel) secret JWT si tu utilises le backoffice
+      JWT_SECRET: "change-moi-en-prod-avec-une-longue-cle"
 
     ports:
       - "3002:3000"
