@@ -1,7 +1,6 @@
 // services/store.pg.js
 import { query } from "../db.js";
 
-
 function normalizeE164(input) {
   if (!input) return null;
   const digits = String(input).replace(/[^\d]/g, "");
@@ -18,26 +17,28 @@ function normalizeSession(input) {
     .replace(/[^\w]/g, "");
 }
 
+// ✅ Routing par session WAHA
 export async function findMerchantByWahaSession(session) {
   const s = normalizeSession(session);
   if (!s) return null;
 
-  const { rows } = await db.query(
+  const res = await query(
     `SELECT * FROM merchants WHERE waha_session = $1 LIMIT 1`,
     [s]
   );
-  return rows[0] || null;
+  return res.rows[0] || null;
 }
 
+// ✅ Routing par numéro WhatsApp (E164)
 export async function findMerchantByWhatsappNumberE164(whatsappNumber) {
   const n = normalizeE164(whatsappNumber);
   if (!n) return null;
 
-  const { rows } = await db.query(
+  const res = await query(
     `SELECT * FROM merchants WHERE whatsapp_number = $1 LIMIT 1`,
     [n]
   );
-  return rows[0] || null;
+  return res.rows[0] || null;
 }
 
 export async function createMerchantWithWaha({
@@ -48,15 +49,15 @@ export async function createMerchantWithWaha({
   wahaSession,
 }) {
   const n = normalizeE164(whatsappNumber);
-  const s = normalizeSession(wahaSession);
+  const s = normalizeSession(wahaSession) || "default";
 
-  const { rows } = await db.query(
+  const res = await query(
     `INSERT INTO merchants (name, email, password_hash, whatsapp_number, waha_session)
      VALUES ($1,$2,$3,$4,$5)
      RETURNING id, name, email, whatsapp_number, waha_session`,
     [name, email, passwordHash, n, s]
   );
-  return rows[0];
+  return res.rows[0];
 }
 
 export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wahaSession }) {
@@ -64,7 +65,7 @@ export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wah
   const n = normalizeE164(whatsappNumber);
   const s = normalizeSession(wahaSession);
 
-  const { rows } = await db.query(
+  const res = await query(
     `UPDATE merchants
      SET whatsapp_number = COALESCE($2, whatsapp_number),
          waha_session    = COALESCE($3, waha_session)
@@ -72,11 +73,20 @@ export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wah
      RETURNING id, name, email, whatsapp_number, waha_session`,
     [id, n, s]
   );
-  return rows[0] || null;
+  return res.rows[0] || null;
+}
+
+// ✅ ALIAS pour compatibilité avec ton server.js actuel
+export async function findMerchantByWhatsappNumber(whatsappNumber) {
+  return findMerchantByWhatsappNumberE164(whatsappNumber);
+}
+
+// ✅ ALIAS pour compatibilité avec ton server.js actuel (il attend createMerchant)
+export async function createMerchant({ name, email, passwordHash, whatsappNumber, wahaSession = "default" }) {
+  return createMerchantWithWaha({ name, email, passwordHash, whatsappNumber, wahaSession });
 }
 
 export { normalizeE164, normalizeSession };
-
 
 /**
  * Trouver ou créer un client pour un marchand donné
