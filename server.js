@@ -532,8 +532,6 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-import { createMerchantWithWaha } from "./services/store.pg.js";
-
 app.post("/api/admin/merchants", adminMiddleware, async (req, res) => {
   try {
     const { name, email, password, whatsapp_number, waha_session } = req.body || {};
