@@ -22,6 +22,7 @@ services:
       # URL n8n
       N8N_COMMAND_BOT_URL: "https://n8n.srv853938.hstgr.cloud/webhook/commandBot"
 
+    
     ports:
       - "3002:3000/tcp"
     networks:
