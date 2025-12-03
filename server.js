@@ -296,63 +296,91 @@ app.post("/webhook/whatsapp", async (req, res) => {
 // WAHA envoie souvent: { event, session, payload: {...} }
 // ================================
 app.post("/webhook/waha", async (req, res) => {
-  // IMPORTANT: répondre vite à WAHA
-  res.sendStatus(200);
-
   try {
-    const root = req.body || {};
-    const p = root.payload || root;
+    const eventWrap = req.body;              // { event, session, payload }
+    const p = eventWrap?.payload || eventWrap;
 
-    const session = root.session || p.session || null;
+    // (optionnel) debug 1 fois pour voir la structure exacte
+    // console.log("WAHA RAW:", JSON.stringify(eventWrap, null, 2));
 
-    // Certaines versions ont fromMe (message sortant) -> on ignore
-    if (p?.fromMe === true || p?.key?.fromMe === true) return;
+    // 0) On ignore les events non-message si tu veux
+    const eventName = eventWrap?.event || p?.event;
+    if (eventName && eventName !== "message") return res.sendStatus(200);
 
-    const rawChatId = p?.chatId || p?.id?.remote || p?.to || null;
-    const rawFrom = p?.from || p?.sender || p?.id?.participant || null;
+    // 1) Récupérer session WAHA (pour trouver le marchand)
+    const sessionName = eventWrap?.session || p?.session;
+    if (!sessionName) return res.sendStatus(200);
 
-    const chatId = normalizeWahaChatId(rawChatId || rawFrom);
-    if (!chatId) return;
-
-    // Ignore status/broadcast
-    if (isStatusBroadcast(chatId) || isStatusBroadcast(rawFrom)) return;
-
-    // Ignorer certains messages système
-    const type = p?.type || root?.type;
-    if (type === "protocolMessage") return;
-
-    const text = String(pickTextFromWaha(root) || "").trim();
-    if (!text) return;
-
-    // téléphone client
-    const customerPhone = normalizePhone(chatIdToPhone(rawFrom || chatId));
-    if (!customerPhone) return;
-
-    // 1) merchant par session (meilleur)
-    let merchant = null;
-    if (session) merchant = await findMerchantByWahaSession(session);
-
-    // 2) fallback: merchant par numéro business si possible
+    const merchant = await findMerchantByWahaSession(sessionName);
     if (!merchant) {
-      const businessNum = normalizePhone(pickBusinessNumberFromPayload(root));
-      if (businessNum) merchant = await findMerchantByWhatsappNumber(businessNum);
+      console.warn("WAHA: merchant introuvable pour session =", sessionName);
+      return res.sendStatus(200);
     }
 
-    if (!merchant) {
-      console.warn("❗ Merchant introuvable (session/num business)", { session });
-      return;
+    // 2) Récupérer le texte du message (selon versions WAHA)
+    const text =
+      (p?.body ?? p?.text ?? p?.message?.text ?? p?.message ?? "").toString().trim();
+
+    if (!text) return res.sendStatus(200);
+
+    // 3) Récupérer le "from" (chatId du CLIENT) et le chatId (conversation)
+    // WAHA met souvent:
+    // - p.from  = l’expéditeur (client) -> C'EST LUI QU'ON DOIT REPONDRE en 1-1
+    // - p.chatId = le chat courant (peut être groupe, ou parfois le business selon l’event)
+    // - p.author / p.participant = expéditeur dans les groupes
+    const rawFrom = p?.from || p?.sender?.id || p?.author || p?.participant;
+    const rawChatId = p?.chatId || p?.id?.remote || p?.conversation || p?.to;
+
+    const fromChatId = normalizeWahaChatId(rawFrom);
+    const chatId = normalizeWahaChatId(rawChatId);
+
+    // 4) Ignore Status/Broadcast (non répondable)
+    if (
+      (fromChatId && (fromChatId.includes("status@broadcast") || fromChatId.includes("false_status@broadcast"))) ||
+      (chatId && (chatId.includes("status@broadcast") || chatId.includes("false_status@broadcast")))
+    ) {
+      return res.sendStatus(200);
     }
 
+    // 5) Déterminer à qui répondre :
+    // - si groupe => répondre au chatId du groupe (@g.us)
+    // - sinon => répondre au fromChatId du client (@c.us ou @lid)
+    const replyChatId = (chatId && chatId.endsWith("@g.us")) ? chatId : fromChatId;
+
+    if (!replyChatId) {
+      console.warn("WAHA: impossible de déterminer replyChatId", { rawFrom, rawChatId });
+      return res.sendStatus(200);
+    }
+
+    // 6) Déterminer le numéro du client pour ta DB (E164)
+    // - si @c.us => on peut récupérer le numéro
+    // - si @lid => ce n'est pas un numéro => on “fallback” sur rawFrom si c’était déjà un +225...
+    let fromPhone = chatIdToPhone(fromChatId);
+    if (!fromPhone) {
+      // fallback si WAHA t’envoie déjà un E164 dans rawFrom (rare)
+      fromPhone = normalizePhone(rawFrom);
+    }
+    if (!fromPhone) {
+      // dernier fallback: on utilise replyChatId comme identifiant (sinon ton système casse)
+      // tu peux aussi décider de return 200 ici si tu refuses les @lid
+      fromPhone = String(fromChatId || replyChatId);
+    }
+
+    // 7) Traitement commun
     await handleIncomingMessage({
-      from: customerPhone,
+      from: fromPhone,
       text,
       merchant,
-      replyChatId: chatId,
+      replyChatId, // ✅ on répond au client (ou groupe)
     });
+
+    return res.sendStatus(200);
   } catch (e) {
-    console.error("Erreur webhook /webhook/waha", e);
+    console.error("Erreur /webhook/waha", e);
+    return res.sendStatus(200);
   }
 });
+
 
 // ================================
 // Admin: lier merchant à WAHA
