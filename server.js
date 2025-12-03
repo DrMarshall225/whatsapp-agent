@@ -251,45 +251,82 @@ app.post("/webhook/whatsapp", async (req, res) => {
 // Webhook WAHA (production)
 // Format WAHA doc: { event, session, payload }
 // ================================
-
 app.post("/webhook/waha", async (req, res) => {
   try {
     const evt = req.body || {};
-    const eventName = evt.event || evt.type || "";
-    const payload = evt.payload || evt.data || evt.message;
+    const eventName = String(evt.event || evt.type || "");
+    const payload = evt.payload || evt.data || evt.message || null;
 
+    // Log ultra clair pour debug
+    console.log("[WAHA] in:", JSON.stringify({
+      eventName,
+      session: evt.session,
+      hasPayload: !!payload,
+      fromMe: payload?.fromMe,
+      from: payload?.from,
+      to: payload?.to,
+      body: payload?.body,
+      text: payload?.text,
+      message: payload?.message,
+    }));
+
+    // On ne traite que les messages entrants
+    // WAHA envoie souvent "message", "message.any", "message.received"
     if (!eventName.startsWith("message") || !payload) return res.sendStatus(200);
+
+    // ignorer messages sortants (anti boucle)
     if (payload.fromMe === true) return res.sendStatus(200);
 
-    // ignore groups + status
-    if (String(payload.from || "").includes("@g.us")) return res.sendStatus(200);
-    if (String(payload.from || "") === "status@broadcast") return res.sendStatus(200);
-
-    // ROUTING
-    let merchant = evt.session ? await findMerchantByWahaSession(evt.session) : null;
+    // ✅ ROUTING PAR SESSION (source de vérité)
+    const sessionRaw = evt.session || payload.session || payload?.chat?.session || null;
+    const merchant = await findMerchantByWahaSession(sessionRaw);
 
     if (!merchant) {
-      const toE164 = chatIdToPhone(evt?.me?.id || payload.to);
-      merchant = await findMerchantByWhatsappNumberE164(toE164);
+      console.warn("[ROUTING] Aucun marchand pour session:", sessionRaw);
+      return res.sendStatus(200);
     }
 
-    if (!merchant) return res.sendStatus(200);
+    console.log("[ROUTING] OK:", JSON.stringify({
+      sessionRaw,
+      merchantId: merchant.id,
+      merchantName: merchant.name,
+      merchantSession: merchant.waha_session,
+      merchantWhatsapp: merchant.whatsapp_number,
+    }));
 
-    const from = chatIdToPhone(payload.from || payload.participant);
-    const text = payload.body || payload.text || payload.message || payload.caption || "";
-    if (!from || !text) return res.sendStatus(200);
+    // Expéditeur
+    const from =
+      chatIdToPhone(
+        payload.from ||
+        payload.author ||
+        payload.chatId ||
+        payload?.chat?.id
+      );
 
-    // IMPORTANT: on passe merchant pour que la réponse utilise merchant.waha_session
-    await handleIncomingMessage({ from, text, merchant });
+    // Texte (message normal, caption image, etc.)
+    const text =
+      payload.body ||
+      payload.text ||
+      payload.message ||
+      payload.caption ||
+      payload?.content ||
+      (payload._data && payload._data.body) ||
+      "";
 
+    const cleanText = String(text || "").trim();
+
+    if (!from || !cleanText) {
+      console.warn("[WAHA] Champs manquants", { from, cleanText });
+      return res.sendStatus(200);
+    }
+
+    await handleIncomingMessage({ from, text: cleanText, merchant });
     return res.sendStatus(200);
   } catch (e) {
     console.error("Erreur /webhook/waha", e);
     return res.sendStatus(200);
   }
 });
-
-
 
 // ================================
 // Auth middleware
