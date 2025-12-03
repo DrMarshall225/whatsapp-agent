@@ -270,92 +270,36 @@ function normalizeWahaChatId(raw) {
   return digits ? `${digits}@c.us` : null;
 }
 
-
-
 app.post("/webhook/waha", async (req, res) => {
-  try {
-    const evt = req.body || {};
-    const eventName = String(evt.event || evt.type || "");
-    const payload = evt.payload || evt.data || evt.message || null;
+  const payload = req.body;
 
-    
+  const from = payload?.payload?.from || payload?.from; // selon ton format WAHA
+  const chatId = payload?.payload?.chatId || payload?.chatId;
 
-    // Log ultra clair pour debug
-    console.log("[WAHA] in:", JSON.stringify({
-      eventName,
-      session: evt.session,
-      hasPayload: !!payload,
-      fromMe: payload?.fromMe,
-      from: payload?.from,
-      to: payload?.to,
-      body: payload?.body,
-      text: payload?.text,
-      message: payload?.message,
-    }));
-
-    // On ne traite que les messages entrants
-    // WAHA envoie souvent "message", "message.any", "message.received"
-    if (!eventName.startsWith("message") || !payload) return res.sendStatus(200);
-
-    // ignorer messages sortants (anti boucle)
-    if (payload.fromMe === true) return res.sendStatus(200);
-
-    // ✅ ROUTING PAR SESSION (source de vérité)
-    const sessionRaw = evt.session || payload.session || payload?.chat?.session || null;
-    const merchant = await findMerchantByWahaSession(sessionRaw);
-
-    if (!merchant) {
-      console.warn("[ROUTING] Aucun marchand pour session:", sessionRaw);
-      return res.sendStatus(200);
-    }
-
-    console.log("[ROUTING] OK:", JSON.stringify({
-      sessionRaw,
-      merchantId: merchant.id,
-      merchantName: merchant.name,
-      merchantSession: merchant.waha_session,
-      merchantWhatsapp: merchant.whatsapp_number,
-    }));
-
-    // Expéditeur
-    const from =
-      chatIdToPhone(
-        payload.from ||
-        payload.author ||
-        payload.chatId ||
-        payload?.chat?.id
-      );
-
-    // Texte (message normal, caption image, etc.)
-    const text =
-      payload.body ||
-      payload.text ||
-      payload.message ||
-      payload.caption ||
-      payload?.content ||
-      (payload._data && payload._data.body) ||
-      "";
-
-    const cleanText = String(text || "").trim();
-
-    if (!from || !cleanText) {
-      console.warn("[WAHA] Champs manquants", { from, cleanText });
-      return res.sendStatus(200);
-    }
-    const rawFromChatId =
-  payload.from || payload.author || payload.chatId || payload.chat?.id;
-
-  const replyChatId = normalizeWahaChatId(rawFromChatId);
-
-  const fromPhone = chatIdToPhone(rawFromChatId); // pour DB / affichage
-
-    await handleIncomingMessage({ from, text: cleanText, merchant });
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error("Erreur /webhook/waha", e);
+  // 1) Ignore Status / Broadcast (non répondable)
+  if (
+    (from && from.includes("status@broadcast")) ||
+    (from && from.includes("false_status@broadcast")) ||
+    (chatId && chatId.includes("status@broadcast")) ||
+    (chatId && chatId.includes("false_status@broadcast"))
+  ) {
     return res.sendStatus(200);
   }
+
+  // 2) Optionnel : ignore aussi certains types système
+  const type = payload?.payload?.type || payload?.type;
+  if (type === "protocolMessage") return res.sendStatus(200);
+
+  // ... ton traitement normal
+  res.sendStatus(200);
 });
+
+function isSendableChatId(id) {
+  if (!id) return false;
+  if (id.includes("status@broadcast")) return false;
+  if (id.includes("false_status@broadcast")) return false;
+  return id.endsWith("@c.us") || id.endsWith("@g.us");
+}
 
 // ================================
 // Auth middleware
