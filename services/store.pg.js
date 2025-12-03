@@ -278,7 +278,9 @@ export async function clearCart(merchantId, customerId) {
 /* =========================
    Orders
 ========================= */
-export async function createOrderFromCart(merchantId, customerId) {
+export async function createOrderFromCart(merchantId, customerId, recipient) {
+  // recipient: { id, name, phone, address }  (peut être le customer lui-même)
+
   const cartRes = await query(
     `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price, p.name
      FROM cart_items ci
@@ -297,14 +299,29 @@ export async function createOrderFromCart(merchantId, customerId) {
     [customerId, merchantId]
   );
   const customerRow = customerRes.rows[0] || {};
-  const deliveryAddress = customerRow.address || null;
   const paymentMethodSnapshot = customerRow.payment_method || null;
 
   const orderRes = await query(
-    `INSERT INTO orders (merchant_id, customer_id, total_amount, currency, status, delivery_address, payment_method_snapshot)
-     VALUES ($1,$2,$3,$4,'PENDING',$5,$6)
+    `INSERT INTO orders (
+        merchant_id, customer_id, total_amount, currency, status,
+        delivery_address, payment_method_snapshot,
+        recipient_customer_id, recipient_name_snapshot, recipient_phone_snapshot, recipient_address_snapshot
+     )
+     VALUES ($1,$2,$3,$4,'PENDING',$5,$6,$7,$8,$9,$10)
      RETURNING *`,
-    [merchantId, customerId, totalAmount, currency, deliveryAddress, paymentMethodSnapshot]
+    [
+      merchantId,
+      customerId,
+      totalAmount,
+      currency,
+      // delivery_address : on met l'adresse du destinataire si dispo, sinon celle du customer
+      recipient?.address || customerRow.address || null,
+      paymentMethodSnapshot,
+      recipient?.id || null,
+      recipient?.name || null,
+      recipient?.phone || null,
+      recipient?.address || null,
+    ]
   );
 
   const order = orderRes.rows[0];
@@ -406,7 +423,7 @@ export async function updateOrderStatus(merchantId, orderId, status) {
    Customer fields
 ========================= */
 export async function updateCustomerField(merchantId, customerId, field, value) {
-  const allowedFields = ["address", "payment_method"];
+  const allowedFields = ["name", "address", "payment_method"];
   if (!allowedFields.includes(field)) throw new Error(`Champ non autorisé: ${field}`);
 
   const res = await query(
@@ -414,4 +431,17 @@ export async function updateCustomerField(merchantId, customerId, field, value) 
     [value, customerId, merchantId]
   );
   return res.rows[0];
+}
+
+export async function updateCustomerProfile(merchantId, customerId, { name, address, payment_method }) {
+  const res = await query(
+    `UPDATE customers
+     SET name = COALESCE($1, name),
+         address = COALESCE($2, address),
+         payment_method = COALESCE($3, payment_method)
+     WHERE id=$4 AND merchant_id=$5
+     RETURNING *`,
+    [name ?? null, address ?? null, payment_method ?? null, customerId, merchantId]
+  );
+  return res.rows[0] || null;
 }

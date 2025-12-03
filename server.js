@@ -27,6 +27,7 @@ import {
   createMerchant,
   createMerchantWithWaha,
   updateMerchantWahaConfig,
+  updateCustomerProfile,
 } from "./services/store.pg.js";
 
 import { callCommandBot } from "./services/commandbot.js";
@@ -156,6 +157,118 @@ function authMiddleware(req, res, next) {
   }
 }
 
+
+function looksLikeYes(msg) {
+  const s = String(msg || "").trim().toLowerCase();
+  return ["1", "oui", "ouais", "y", "yes", "moi", "pour moi", "c'est moi", "meme"].some(k => s.includes(k));
+}
+function looksLikeNo(msg) {
+  const s = String(msg || "").trim().toLowerCase();
+  return ["2", "non", "autre", "tiers", "tierce", "quelqu'un", "quelquun", "pour lui", "pour elle"].some(k => s.includes(k));
+}
+
+/**
+ * Si le client est en train de répondre à une question structurée (nom, choix 1/2, tel destinataire...)
+ * on traite ici SANS appeler l'IA.
+ */
+async function tryHandleStructuredReply({ merchant, customer, text, conversationState }) {
+  const waiting = conversationState?.waiting_field;
+  if (!waiting) return { handled: false };
+
+  const clean = String(text || "").trim();
+  if (!clean) return { handled: true, message: "Je n’ai pas bien reçu. Peux-tu répéter ?" };
+
+  // 1) Choix : pour moi / pour quelqu'un d'autre
+  if (waiting === "recipient_mode") {
+    if (looksLikeYes(clean)) {
+      // self
+      const nextState = { ...conversationState, recipient_mode: "self", waiting_field: null, step: null };
+      await setConversationState(merchant.id, customer.id, nextState);
+
+      if (!customer.name) {
+        await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "self_name" });
+        return { handled: true, message: "D’accord 😊. Quel est ton nom (et prénom) ?" };
+      }
+
+      // nom déjà connu => on confirme tout de suite
+      const { order } = await createOrderFromCart(merchant.id, customer.id, {
+        id: customer.id,
+        name: customer.name,
+        phone: customer.phone,
+        address: customer.address || null,
+      });
+      await setConversationState(merchant.id, customer.id, {}); // reset
+      return { handled: true, message: `Merci ${customer.name} ✅. Ta commande #${order.id} est confirmée.` };
+    }
+
+    if (looksLikeNo(clean)) {
+      const nextState = { ...conversationState, recipient_mode: "third_party", waiting_field: "recipient_name", step: "ASKING_INFO" };
+      await setConversationState(merchant.id, customer.id, nextState);
+      return { handled: true, message: "Très bien. Donne-moi le *nom et prénom* de la personne qui recevra la commande." };
+    }
+
+    return { handled: true, message: "Réponds : *1* = pour toi-même, *2* = pour une autre personne." };
+  }
+
+  // 2) Nom du client (self)
+  if (waiting === "self_name") {
+    await updateCustomerField(merchant.id, customer.id, "name", clean);
+    await setConversationState(merchant.id, customer.id, {}); // reset
+
+    const { order } = await createOrderFromCart(merchant.id, customer.id, {
+      id: customer.id,
+      name: clean,
+      phone: customer.phone,
+      address: customer.address || null,
+    });
+
+    return { handled: true, message: `Merci ${clean} ✅. Ta commande #${order.id} est confirmée.` };
+  }
+
+  // 3) Tiers : nom
+  if (waiting === "recipient_name") {
+    const nextState = { ...conversationState, recipient_name: clean, waiting_field: "recipient_phone", step: "ASKING_INFO" };
+    await setConversationState(merchant.id, customer.id, nextState);
+    return { handled: true, message: "Super. Donne-moi maintenant son *numéro WhatsApp* (format 225XXXXXXXXXX)." };
+  }
+
+  // 4) Tiers : téléphone (obligatoire pour créer un customer propre)
+  if (waiting === "recipient_phone") {
+    const phone = normalizePhone(clean); // tu as déjà normalizePhone dans server.js
+    if (!phone) return { handled: true, message: "Numéro invalide. Envoie le numéro au format: 225XXXXXXXXXX" };
+
+    const nextState = { ...conversationState, recipient_phone: phone, waiting_field: "recipient_address", step: "ASKING_INFO" };
+    await setConversationState(merchant.id, customer.id, nextState);
+    return { handled: true, message: "Merci. Et l’*adresse de livraison* du destinataire ?" };
+  }
+
+  // 5) Tiers : adresse puis confirmation
+  if (waiting === "recipient_address") {
+    const st = { ...conversationState, recipient_address: clean };
+    // créer/charger le destinataire
+    const recipient = await findOrCreateCustomer(merchant.id, st.recipient_phone);
+
+    await updateCustomerProfile(merchant.id, recipient.id, {
+      name: st.recipient_name || null,
+      address: st.recipient_address || null,
+    });
+
+    const { order } = await createOrderFromCart(merchant.id, customer.id, {
+      id: recipient.id,
+      name: st.recipient_name || recipient.name || null,
+      phone: st.recipient_phone,
+      address: st.recipient_address,
+    });
+
+    await setConversationState(merchant.id, customer.id, {}); // reset
+
+    const who = st.recipient_name ? `pour ${st.recipient_name}` : "pour le destinataire";
+    return { handled: true, message: `Parfait ✅. Commande #${order.id} confirmée ${who}.` };
+  }
+
+  return { handled: false };
+}
+
 // ================================
 // Healthcheck
 // ================================
@@ -173,6 +286,14 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const cart = await getCart(merchant.id, customer.id);
   const products = await getProductsForMerchant(merchant.id);
   const conversationState = await getConversationState(merchant.id, customer.id);
+// ✅ 0) Si on collecte une info (nom, choix, tiers...), on traite sans IA
+const fast = await tryHandleStructuredReply({ merchant, customer, text, conversationState });
+if (fast.handled) {
+  if (fast.message) {
+    await sendWhatsappMessage({ merchant, chatId: replyChatId, to: from, text: fast.message });
+  }
+  return { message: fast.message, actions: [] };
+}
 
   const agentOutput = await callCommandBot({
     message: text,
@@ -241,9 +362,29 @@ async function applyAction(action, context) {
       await updateCustomerField(merchant.id, customer.id, action.field, action.value);
       break;
 
-    case "CONFIRM_ORDER":
-      await createOrderFromCart(merchant.id, customer.id);
-      break;
+   case "CONFIRM_ORDER": {
+  // si on ne sait pas encore si c'est pour lui-même ou un tiers => demander
+  const st = await getConversationState(merchant.id, customer.id);
+
+  if (!st?.recipient_mode) {
+    await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "recipient_mode" });
+    // on ne crée pas la commande tout de suite
+  } else if (st.recipient_mode === "self") {
+    if (!customer.name) {
+      await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "self_name", recipient_mode: "self" });
+    } else {
+      await createOrderFromCart(merchant.id, customer.id, { id: customer.id, name: customer.name, phone: customer.phone, address: customer.address || null });
+      await setConversationState(merchant.id, customer.id, {});
+    }
+  } else if (st.recipient_mode === "third_party") {
+    // si l'IA a déjà rempli les infos dans st, on peut continuer via tryHandleStructuredReply
+    if (!st.recipient_name) {
+      await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_name" });
+    }
+  }
+  break;
+}
+
 
     case "ASK_INFO":
       await setConversationState(merchant.id, customer.id, {
