@@ -283,66 +283,65 @@ app.get("/", (req, res) => {
 // Moteur commun (utilisé par WAHA + Postman)
 // ================================
 async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
-  console.log("📩 Message reçu", { from, merchantId: merchant?.id, text, replyChatId });
+  console.log("📩 Message reçu", {
+    from,
+    merchantId: merchant?.id,
+    text,
+    replyChatId,
+  });
 
   const customer = await findOrCreateCustomer(merchant.id, from);
   const cart = await getCart(merchant.id, customer.id);
   const products = await getProductsForMerchant(merchant.id);
   const conversationState = await getConversationState(merchant.id, customer.id);
-  const context = { merchant, customer, overrideMessage: null };
 
-if (Array.isArray(agentOutput?.actions)) {
-  for (const action of agentOutput.actions) await applyAction(action, context);
-}
+  // ✅ IMPORTANT: déclarer AVANT toute utilisation
+  let agentOutput = null;
 
-const messageToSend = context.overrideMessage || agentOutput?.message;
-
-if (messageToSend) {
-  await sendWhatsappMessage({ merchant, chatId: replyChatId, to: from, text: messageToSend });
-}
-
-// ✅ 0) Si on collecte une info (nom, choix, tiers...), on traite sans IA
-const fast = await tryHandleStructuredReply({ merchant, customer, text, conversationState });
-if (fast.handled) {
-  if (fast.message) {
-    await sendWhatsappMessage({ merchant, chatId: replyChatId, to: from, text: fast.message });
-  }
-  return { message: fast.message, actions: [] };
-}
-
-  const agentOutput = await callCommandBot({
-    message: text,
-    merchant: { id: merchant.id, name: merchant.name },
-    customer: {
-      id: customer.id,
-      phone: customer.phone,
-      name: customer.name,
-      known_fields: {
-        address: customer.address,
-        payment_method: customer.payment_method,
+  try {
+    agentOutput = await callCommandBot({
+      message: text, // ou "userText" selon ton n8n, mais garde ce qui marche déjà chez toi
+      merchant: { id: merchant.id, name: merchant.name },
+      customer: {
+        id: customer.id,
+        phone: customer.phone,
+        name: customer.name,
+        known_fields: {
+          address: customer.address,
+          payment_method: customer.payment_method,
+        },
       },
-    },
-    cart,
-    products,
-    conversation_state: conversationState,
-  });
-
-  if (Array.isArray(agentOutput?.actions)) {
-    for (const action of agentOutput.actions) {
-      await applyAction(action, { merchant, customer });
-    }
+      cart,
+      products,
+      conversation_state: conversationState,
+    });
+  } catch (e) {
+    console.error("❌ callCommandBot error:", e);
+    agentOutput = {
+      message:
+        "Désolé, j’ai eu un souci technique. Pouvez-vous réessayer dans un instant ?",
+      actions: [],
+    };
   }
 
-  if (agentOutput?.message) {
+  const actions = Array.isArray(agentOutput?.actions) ? agentOutput.actions : [];
+
+  for (const action of actions) {
+    await applyAction(action, { merchant, customer });
+  }
+
+  const outgoingMsg = agentOutput?.message ? String(agentOutput.message).trim() : "";
+
+  if (outgoingMsg) {
     await sendWhatsappMessage({
       merchant,
-      chatId: replyChatId, // ✅ répond au chat exact
-      to: from, // fallback
-      text: agentOutput.message,
+      chatId: replyChatId, // ✅ répondre au chat reçu (client ou groupe)
+      to: from,            // fallback
+      text: outgoingMsg,
     });
   }
 
-  return agentOutput || { message: null, actions: [] };
+  return { message: outgoingMsg || null, actions };
 }
 
 
