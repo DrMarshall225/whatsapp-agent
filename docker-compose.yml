@@ -5,8 +5,8 @@ services:
     container_name: whatsapp-agent
     restart: unless-stopped
     environment:
-      WAHA_PRINT_QR: false
-      
+      WAHA_PRINT_QR: "false"
+
       PORT: "3000"
 
       DB_HOST: "65.109.27.58"
