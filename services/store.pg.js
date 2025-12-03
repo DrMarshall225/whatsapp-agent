@@ -56,12 +56,12 @@ export async function findMerchantByEmail(email) {
 }
 
 /**
- * Server.js importe "createMerchant" → on le fournit.
- * Ici on exige wahaSession (multi sessions)
+ * createMerchant — compatible "register"
+ * ✅ wahaSession devient OPTIONNEL, pour ne pas casser /api/auth/register
  */
-export async function createMerchant({ name, email, passwordHash, whatsappNumber, wahaSession }) {
+export async function createMerchant({ name, email, passwordHash, whatsappNumber, wahaSession = null }) {
   const n = normalizeE164(whatsappNumber);
-  const s = normalizeSession(wahaSession);
+  const s = wahaSession ? normalizeSession(wahaSession) : null;
 
   const res = await query(
     `INSERT INTO merchants (name, email, password_hash, whatsapp_number, waha_session)
@@ -72,10 +72,35 @@ export async function createMerchant({ name, email, passwordHash, whatsappNumber
   return res.rows[0];
 }
 
-export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wahaSession }) {
-  const id = Number(merchantId);
+/**
+ * ✅ AJOUT: createMerchantWithWaha
+ * Ton server.js l'importe, donc on le fournit.
+ * Exige wahaSession (logique "admin create merchant")
+ */
+export async function createMerchantWithWaha({ name, email, passwordHash, whatsappNumber, wahaSession }) {
   const n = normalizeE164(whatsappNumber);
   const s = normalizeSession(wahaSession);
+
+  if (!s) {
+    throw new Error("wahaSession est obligatoire pour createMerchantWithWaha()");
+  }
+
+  const res = await query(
+    `INSERT INTO merchants (name, email, password_hash, whatsapp_number, waha_session)
+     VALUES ($1,$2,$3,$4,$5)
+     RETURNING id, name, email, whatsapp_number, waha_session`,
+    [name, email, passwordHash, n, s]
+  );
+
+  return res.rows[0];
+}
+
+export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wahaSession }) {
+  const id = Number(merchantId);
+
+  // ⚠️ Important: COALESCE($2, whatsapp_number) => si $2 est null, pas de changement
+  const n = whatsappNumber !== undefined ? normalizeE164(whatsappNumber) : null;
+  const s = wahaSession !== undefined ? normalizeSession(wahaSession) : null;
 
   const res = await query(
     `UPDATE merchants
@@ -288,7 +313,6 @@ export async function createOrderFromCart(merchantId, customerId) {
   const params = [order.id];
 
   items.forEach((item, idx) => {
-    // order_id est $1
     const base = idx * 4 + 2;
     values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3})`);
     params.push(item.product_id, item.quantity, item.unit_price, item.total_price);
