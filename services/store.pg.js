@@ -2,75 +2,66 @@
 import { query } from "../db.js";
 
 /* =========================
-   Helpers
+   Normalisers
 ========================= */
-function normalizeE164(input) {
+export function normalizeE164(input) {
   if (!input) return null;
   const digits = String(input).replace(/[^\d]/g, "");
   return digits ? `+${digits}` : null;
 }
 
-function normalizeSession(input) {
+export function normalizeSession(input) {
   if (!input) return null;
-  // ex: "Ferme DEM" -> "ferme_dem"
   return String(input)
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "_")
-    .replace(/[^\w]/g, ""); // garde [a-z0-9_]
+    .replace(/[^\w]/g, "");
 }
 
-export { normalizeE164, normalizeSession };
-
 /* =========================
-   Merchants (Routing)
+   Merchants (routing)
 ========================= */
-
-// ✅ Routing par session WAHA (le plus fiable en multi-sessions)
 export async function findMerchantByWahaSession(session) {
   const s = normalizeSession(session);
   if (!s) return null;
 
   const res = await query(
-    `SELECT *
-     FROM merchants
-     WHERE waha_session = $1
-     LIMIT 1`,
+    `SELECT * FROM merchants WHERE waha_session = $1 LIMIT 1`,
     [s]
   );
   return res.rows[0] || null;
 }
 
-// ✅ Routing par numéro WhatsApp (E164)
-export async function findMerchantByWhatsappNumberE164(whatsappNumber) {
+export async function findMerchantByWhatsappNumber(whatsappNumber) {
   const n = normalizeE164(whatsappNumber);
   if (!n) return null;
 
   const res = await query(
-    `SELECT *
-     FROM merchants
-     WHERE whatsapp_number = $1
-     LIMIT 1`,
+    `SELECT * FROM merchants WHERE whatsapp_number = $1 LIMIT 1`,
     [n]
   );
   return res.rows[0] || null;
 }
 
-// ✅ Alias attendu par ton server.js (ancienne signature)
-export async function findMerchantByWhatsappNumber(whatsappNumber) {
-  return findMerchantByWhatsappNumberE164(whatsappNumber);
+export async function findMerchantByEmail(email) {
+  const res = await query(
+    `SELECT id, name, email, password_hash, whatsapp_number, waha_session
+     FROM merchants
+     WHERE email = $1
+     LIMIT 1`,
+    [email]
+  );
+  return res.rows[0] || null;
 }
 
-// ✅ Création marchand avec waha_session
-export async function createMerchantWithWaha({
-  name,
-  email,
-  passwordHash,
-  whatsappNumber,
-  wahaSession,
-}) {
+/**
+ * Server.js importe "createMerchant" → on le fournit.
+ * Ici on exige wahaSession (multi sessions)
+ */
+export async function createMerchant({ name, email, passwordHash, whatsappNumber, wahaSession }) {
   const n = normalizeE164(whatsappNumber);
-  const s = normalizeSession(wahaSession) || "default";
+  const s = normalizeSession(wahaSession);
 
   const res = await query(
     `INSERT INTO merchants (name, email, password_hash, whatsapp_number, waha_session)
@@ -79,17 +70,6 @@ export async function createMerchantWithWaha({
     [name, email, passwordHash, n, s]
   );
   return res.rows[0];
-}
-
-// ✅ Alias attendu par ton server.js (il essayait d'importer createMerchant)
-export async function createMerchant({
-  name,
-  email,
-  passwordHash,
-  whatsappNumber,
-  wahaSession = "default",
-}) {
-  return createMerchantWithWaha({ name, email, passwordHash, whatsappNumber, wahaSession });
 }
 
 export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wahaSession }) {
@@ -104,16 +84,6 @@ export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wah
      WHERE id = $1
      RETURNING id, name, email, whatsapp_number, waha_session`,
     [id, n, s]
-  );
-  return res.rows[0] || null;
-}
-
-export async function findMerchantByEmail(email) {
-  const res = await query(
-    `SELECT id, name, email, password_hash, whatsapp_number, waha_session
-     FROM merchants
-     WHERE email = $1`,
-    [email]
   );
   return res.rows[0] || null;
 }
@@ -141,36 +111,15 @@ export async function findOrCreateCustomer(merchantId, phone) {
   return inserted.rows[0];
 }
 
-export async function updateCustomerField(merchantId, customerId, field, value) {
-  const allowedFields = ["address", "payment_method"];
-  if (!allowedFields.includes(field)) {
-    throw new Error(`Champ client non autorisé: ${field}`);
-  }
-
-  const sql = `
-    UPDATE customers
-    SET ${field} = $1
-    WHERE id = $2
-      AND merchant_id = $3
-    RETURNING *;
-  `;
-
-  const result = await query(sql, [value, customerId, merchantId]);
-  return result.rows[0];
-}
-
 /* =========================
    Products
 ========================= */
 export async function getProductsForMerchant(merchantId) {
-  const sql = `
-    SELECT *
-    FROM products
-    WHERE merchant_id = $1
-    ORDER BY id
-  `;
-  const result = await query(sql, [merchantId]);
-  return result.rows;
+  const res = await query(
+    `SELECT * FROM products WHERE merchant_id = $1 ORDER BY id`,
+    [merchantId]
+  );
+  return res.rows;
 }
 
 export async function createProductForMerchant(merchantId, productData) {
@@ -184,34 +133,13 @@ export async function createProductForMerchant(merchantId, productData) {
     image_url = null,
   } = productData;
 
-  const sql = `
-    INSERT INTO products (
-      merchant_id,
-      name,
-      description,
-      price,
-      currency,
-      code,
-      category,
-      image_url
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    RETURNING *;
-  `;
-
-  const params = [
-    merchantId,
-    name,
-    description,
-    price,
-    currency,
-    code,
-    category,
-    image_url,
-  ];
-
-  const result = await query(sql, params);
-  return result.rows[0];
+  const res = await query(
+    `INSERT INTO products (merchant_id, name, description, price, currency, code, category, image_url)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     RETURNING *`,
+    [merchantId, name, description, price, currency, code, category, image_url]
+  );
+  return res.rows[0];
 }
 
 export async function updateProductForMerchant(merchantId, productId, productData) {
@@ -226,153 +154,99 @@ export async function updateProductForMerchant(merchantId, productId, productDat
     is_active = true,
   } = productData;
 
-  const sql = `
-    UPDATE products
-    SET
-      name = $1,
-      description = $2,
-      price = $3,
-      currency = $4,
-      code = $5,
-      category = $6,
-      image_url = $7,
-      is_active = $8,
-      updated_at = NOW()
-    WHERE id = $9 AND merchant_id = $10
-    RETURNING *;
-  `;
+  const res = await query(
+    `UPDATE products
+     SET name=$1, description=$2, price=$3, currency=$4, code=$5, category=$6,
+         image_url=$7, is_active=$8, updated_at=NOW()
+     WHERE id=$9 AND merchant_id=$10
+     RETURNING *`,
+    [name, description, price, currency, code, category, image_url, is_active, productId, merchantId]
+  );
 
-  const params = [
-    name,
-    description,
-    price,
-    currency,
-    code,
-    category,
-    image_url,
-    is_active,
-    productId,
-    merchantId,
-  ];
-
-  const result = await query(sql, params);
-  return result.rows[0] || null;
+  return res.rows[0] || null;
 }
 
 export async function deleteProductForMerchant(merchantId, productId) {
-  const sql = `DELETE FROM products WHERE id = $1 AND merchant_id = $2`;
-  await query(sql, [productId, merchantId]);
+  await query(`DELETE FROM products WHERE id=$1 AND merchant_id=$2`, [productId, merchantId]);
   return true;
 }
 
 /* =========================
-   Conversation State
+   Conversation state
 ========================= */
 export async function getConversationState(merchantId, customerId) {
-  const sql = `
-    SELECT state
-    FROM conversation_states
-    WHERE merchant_id = $1 AND customer_id = $2
-    LIMIT 1
-  `;
-  const result = await query(sql, [merchantId, customerId]);
-  return result.rows[0]?.state || {};
+  const res = await query(
+    `SELECT state FROM conversation_states
+     WHERE merchant_id=$1 AND customer_id=$2 LIMIT 1`,
+    [merchantId, customerId]
+  );
+  return res.rows[0]?.state || {};
 }
 
 export async function setConversationState(merchantId, customerId, state) {
-  const sql = `
-    INSERT INTO conversation_states (merchant_id, customer_id, state)
-    VALUES ($1, $2, $3::jsonb)
-    ON CONFLICT (merchant_id, customer_id)
-    DO UPDATE SET state = EXCLUDED.state
-    RETURNING state
-  `;
-  const result = await query(sql, [merchantId, customerId, JSON.stringify(state)]);
-  return result.rows[0].state;
+  const res = await query(
+    `INSERT INTO conversation_states (merchant_id, customer_id, state)
+     VALUES ($1,$2,$3::jsonb)
+     ON CONFLICT (merchant_id, customer_id)
+     DO UPDATE SET state=EXCLUDED.state
+     RETURNING state`,
+    [merchantId, customerId, JSON.stringify(state)]
+  );
+  return res.rows[0].state;
 }
 
 /* =========================
    Cart
 ========================= */
 export async function getCart(merchantId, customerId) {
-  const sql = `
-    SELECT ci.product_id,
-           ci.quantity,
-           p.name,
-           p.price
-    FROM cart_items ci
-    JOIN products p ON p.id = ci.product_id
-    WHERE ci.merchant_id = $1
-      AND ci.customer_id = $2
-    ORDER BY ci.id
-  `;
-  const result = await query(sql, [merchantId, customerId]);
-  return result.rows;
+  const res = await query(
+    `SELECT ci.product_id, ci.quantity, p.name, p.price
+     FROM cart_items ci
+     JOIN products p ON p.id = ci.product_id
+     WHERE ci.merchant_id=$1 AND ci.customer_id=$2
+     ORDER BY ci.id`,
+    [merchantId, customerId]
+  );
+  return res.rows;
 }
 
 export async function addToCart(merchantId, customerId, productId, quantity) {
   const productRes = await query(
-    `SELECT price
-     FROM products
-     WHERE id = $1 AND merchant_id = $2`,
+    `SELECT price FROM products WHERE id=$1 AND merchant_id=$2`,
     [productId, merchantId]
   );
-
   if (productRes.rowCount === 0) {
-    throw new Error(`Produit ${productId} introuvable pour le marchand ${merchantId}`);
+    throw new Error(`Produit ${productId} introuvable pour marchand ${merchantId}`);
   }
 
   const unitPrice = Number(productRes.rows[0].price);
   const totalPrice = unitPrice * quantity;
 
-  const sql = `
-    INSERT INTO cart_items (
-      merchant_id,
-      customer_id,
-      product_id,
-      quantity,
-      unit_price,
-      total_price
-    )
-    VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT (merchant_id, customer_id, product_id)
-    DO UPDATE SET
-      quantity    = cart_items.quantity + EXCLUDED.quantity,
-      unit_price  = EXCLUDED.unit_price,
-      total_price = (cart_items.quantity + EXCLUDED.quantity) * EXCLUDED.unit_price
-    RETURNING *;
-  `;
+  const res = await query(
+    `INSERT INTO cart_items (merchant_id, customer_id, product_id, quantity, unit_price, total_price)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (merchant_id, customer_id, product_id)
+     DO UPDATE SET
+       quantity = cart_items.quantity + EXCLUDED.quantity,
+       unit_price = EXCLUDED.unit_price,
+       total_price = (cart_items.quantity + EXCLUDED.quantity) * EXCLUDED.unit_price
+     RETURNING *`,
+    [merchantId, customerId, productId, quantity, unitPrice, totalPrice]
+  );
 
-  const result = await query(sql, [
-    merchantId,
-    customerId,
-    productId,
-    quantity,
-    unitPrice,
-    totalPrice,
-  ]);
-
-  return result.rows[0];
+  return res.rows[0];
 }
 
 export async function removeFromCart(merchantId, customerId, productId) {
-  const sql = `
-    DELETE FROM cart_items
-    WHERE merchant_id = $1
-      AND customer_id = $2
-      AND product_id = $3
-  `;
-  await query(sql, [merchantId, customerId, productId]);
+  await query(
+    `DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2 AND product_id=$3`,
+    [merchantId, customerId, productId]
+  );
   return true;
 }
 
 export async function clearCart(merchantId, customerId) {
-  const sql = `
-    DELETE FROM cart_items
-    WHERE merchant_id = $1
-      AND customer_id = $2
-  `;
-  await query(sql, [merchantId, customerId]);
+  await query(`DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2`, [merchantId, customerId]);
   return true;
 }
 
@@ -381,140 +255,87 @@ export async function clearCart(merchantId, customerId) {
 ========================= */
 export async function createOrderFromCart(merchantId, customerId) {
   const cartRes = await query(
-    `
-    SELECT
-      ci.product_id,
-      ci.quantity,
-      ci.unit_price,
-      ci.total_price,
-      p.name
-    FROM cart_items ci
-    JOIN products p ON p.id = ci.product_id
-    WHERE ci.merchant_id = $1
-      AND ci.customer_id = $2
-    `,
+    `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price, p.name
+     FROM cart_items ci
+     JOIN products p ON p.id = ci.product_id
+     WHERE ci.merchant_id=$1 AND ci.customer_id=$2`,
     [merchantId, customerId]
   );
-
-  if (cartRes.rowCount === 0) {
-    throw new Error(`Aucun article dans le panier pour le marchand ${merchantId}, client ${customerId}`);
-  }
+  if (cartRes.rowCount === 0) throw new Error("Panier vide");
 
   const items = cartRes.rows;
-  const totalAmount = items.reduce((sum, item) => sum + Number(item.total_price), 0);
+  const totalAmount = items.reduce((sum, it) => sum + Number(it.total_price), 0);
   const currency = "XOF";
 
   const customerRes = await query(
-    `SELECT address, payment_method
-     FROM customers
-     WHERE id = $1 AND merchant_id = $2`,
+    `SELECT address, payment_method FROM customers WHERE id=$1 AND merchant_id=$2`,
     [customerId, merchantId]
   );
-
   const customerRow = customerRes.rows[0] || {};
   const deliveryAddress = customerRow.address || null;
   const paymentMethodSnapshot = customerRow.payment_method || null;
 
   const orderRes = await query(
-    `
-    INSERT INTO orders (
-      merchant_id,
-      customer_id,
-      total_amount,
-      currency,
-      status,
-      delivery_address,
-      payment_method_snapshot
-    )
-    VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)
-    RETURNING *;
-    `,
+    `INSERT INTO orders (merchant_id, customer_id, total_amount, currency, status, delivery_address, payment_method_snapshot)
+     VALUES ($1,$2,$3,$4,'PENDING',$5,$6)
+     RETURNING *`,
     [merchantId, customerId, totalAmount, currency, deliveryAddress, paymentMethodSnapshot]
   );
 
   const order = orderRes.rows[0];
 
   const values = [];
-  const params = [];
+  const params = [order.id];
 
-  items.forEach((item, index) => {
-    values.push(
-      `($1, $${index * 4 + 2}, $${index * 4 + 3}, $${index * 4 + 4}, $${index * 4 + 5})`
-    );
+  items.forEach((item, idx) => {
+    // order_id est $1
+    const base = idx * 4 + 2;
+    values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3})`);
     params.push(item.product_id, item.quantity, item.unit_price, item.total_price);
   });
 
-  params.unshift(order.id);
-
-  const insertItemsSql = `
-    INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
-    VALUES ${values.join(", ")}
-  `;
-  await query(insertItemsSql, params);
-
   await query(
-    `DELETE FROM cart_items
-     WHERE merchant_id = $1 AND customer_id = $2`,
-    [merchantId, customerId]
+    `INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+     VALUES ${values.join(", ")}`,
+    params
   );
+
+  await query(`DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2`, [merchantId, customerId]);
 
   return { order, items };
 }
 
 export async function getOrdersForMerchant(merchantId) {
-  const sql = `
-    SELECT
-      o.id,
-      o.merchant_id,
-      o.customer_id,
-      o.total_amount,
-      o.currency,
-      o.status,
-      o.created_at,
-      c.name AS customer_name,
-      c.phone AS customer_phone
-    FROM orders o
-    JOIN customers c ON c.id = o.customer_id
-    WHERE o.merchant_id = $1
-    ORDER BY o.created_at DESC
-  `;
-  const result = await query(sql, [merchantId]);
-  return result.rows;
+  const res = await query(
+    `SELECT o.id, o.merchant_id, o.customer_id, o.total_amount, o.currency, o.status, o.created_at,
+            c.name AS customer_name, c.phone AS customer_phone
+     FROM orders o
+     JOIN customers c ON c.id = o.customer_id
+     WHERE o.merchant_id=$1
+     ORDER BY o.created_at DESC`,
+    [merchantId]
+  );
+  return res.rows;
 }
 
 export async function getOrderWithItems(merchantId, orderId) {
   const orderRes = await query(
-    `
-    SELECT
-      o.*,
-      c.name  AS customer_name,
-      c.phone AS customer_phone
-    FROM orders o
-    JOIN customers c ON c.id = o.customer_id
-    WHERE o.id = $1
-      AND o.merchant_id = $2
-    `,
+    `SELECT o.*, c.name AS customer_name, c.phone AS customer_phone
+     FROM orders o
+     JOIN customers c ON c.id = o.customer_id
+     WHERE o.id=$1 AND o.merchant_id=$2`,
     [orderId, merchantId]
   );
-
   if (orderRes.rowCount === 0) return null;
 
   const orderRow = orderRes.rows[0];
 
   const itemsRes = await query(
-    `
-    SELECT
-      oi.id,
-      oi.product_id,
-      oi.quantity,
-      oi.unit_price,
-      oi.total_price,
-      p.name AS product_name
-    FROM order_items oi
-    JOIN products p ON p.id = oi.product_id
-    WHERE oi.order_id = $1
-    ORDER BY oi.id ASC
-    `,
+    `SELECT oi.id, oi.product_id, oi.quantity, oi.unit_price, oi.total_price, p.name AS product_name
+     FROM order_items oi
+     JOIN products p ON p.id = oi.product_id
+     WHERE oi.order_id=$1
+     ORDER BY oi.id ASC`,
     [orderId]
   );
 
@@ -547,19 +368,26 @@ export async function getOrderWithItems(merchantId, orderId) {
 }
 
 export async function updateOrderStatus(merchantId, orderId, status) {
-  const allowedStatuses = ["PENDING", "CONFIRMED", "DELIVERED", "CANCELED"];
-  if (!allowedStatuses.includes(status)) {
-    throw new Error(`Statut de commande invalide: ${status}`);
-  }
+  const allowed = ["PENDING", "CONFIRMED", "DELIVERED", "CANCELED"];
+  if (!allowed.includes(status)) throw new Error(`Statut invalide: ${status}`);
 
-  const sql = `
-    UPDATE orders
-    SET status = $1
-    WHERE id = $2
-      AND merchant_id = $3
-    RETURNING *;
-  `;
+  const res = await query(
+    `UPDATE orders SET status=$1 WHERE id=$2 AND merchant_id=$3 RETURNING *`,
+    [status, orderId, merchantId]
+  );
+  return res.rows[0] || null;
+}
 
-  const result = await query(sql, [status, orderId, merchantId]);
-  return result.rows[0] || null;
+/* =========================
+   Customer fields
+========================= */
+export async function updateCustomerField(merchantId, customerId, field, value) {
+  const allowedFields = ["address", "payment_method"];
+  if (!allowedFields.includes(field)) throw new Error(`Champ non autorisé: ${field}`);
+
+  const res = await query(
+    `UPDATE customers SET ${field}=$1 WHERE id=$2 AND merchant_id=$3 RETURNING *`,
+    [value, customerId, merchantId]
+  );
+  return res.rows[0];
 }

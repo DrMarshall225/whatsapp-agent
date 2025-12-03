@@ -131,8 +131,8 @@ function pickBusinessNumberFromPayload(payload) {
 // ================================
 // Moteur commun (WhatsApp test + WAHA)
 // ================================
-async function handleIncomingMessage({ from, text, merchant }) {
-  console.log("Message reçu", { from, merchantId: merchant?.id, text });
+async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
+  console.log("Message reçu", { from, merchantId: merchant?.id, text, replyChatId });
 
   const customer = await findOrCreateCustomer(merchant.id, from);
   const cart = await getCart(merchant.id, customer.id);
@@ -157,8 +157,9 @@ async function handleIncomingMessage({ from, text, merchant }) {
 
   if (agentOutput?.message) {
     await sendWhatsappMessage({
-      merchant,          // <<< clé du multi-marchands
-      to: from,
+      merchant,
+      chatId: replyChatId, // ✅ on répond au chat exact WAHA
+      to: from,            // optionnel (fallback)
       text: agentOutput.message,
     });
   }
@@ -251,11 +252,33 @@ app.post("/webhook/whatsapp", async (req, res) => {
 // Webhook WAHA (production)
 // Format WAHA doc: { event, session, payload }
 // ================================
+function normalizeWahaChatId(raw) {
+  if (!raw) return null;
+  const s = String(raw);
+
+  // Si WAHA donne @s.whatsapp.net, convertir en @c.us
+  if (s.endsWith("@s.whatsapp.net")) return s.replace("@s.whatsapp.net", "@c.us");
+
+  // Si WAHA donne @lid, on garde @lid (IMPORTANT)
+  if (s.endsWith("@lid")) return s;
+
+  // Si déjà @c.us ou groupe etc, garder
+  if (s.includes("@")) return s;
+
+  // Sinon chiffres -> @c.us
+  const digits = s.replace(/[^\d]/g, "");
+  return digits ? `${digits}@c.us` : null;
+}
+
+
+
 app.post("/webhook/waha", async (req, res) => {
   try {
     const evt = req.body || {};
     const eventName = String(evt.event || evt.type || "");
     const payload = evt.payload || evt.data || evt.message || null;
+
+    
 
     // Log ultra clair pour debug
     console.log("[WAHA] in:", JSON.stringify({
@@ -319,6 +342,12 @@ app.post("/webhook/waha", async (req, res) => {
       console.warn("[WAHA] Champs manquants", { from, cleanText });
       return res.sendStatus(200);
     }
+    const rawFromChatId =
+  payload.from || payload.author || payload.chatId || payload.chat?.id;
+
+  const replyChatId = normalizeWahaChatId(rawFromChatId);
+
+  const fromPhone = chatIdToPhone(rawFromChatId); // pour DB / affichage
 
     await handleIncomingMessage({ from, text: cleanText, merchant });
     return res.sendStatus(200);
