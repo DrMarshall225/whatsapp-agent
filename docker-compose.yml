@@ -5,6 +5,8 @@ services:
     container_name: whatsapp-agent
     restart: unless-stopped
     environment:
+      WAHA_PRINT_QR: false
+      
       PORT: "3000"
 
       DB_HOST: "65.109.27.58"
@@ -16,7 +18,7 @@ services:
       # Appeler WAHA via le réseau docker (service name = waha)
       WAHA_BASE_URL: "http://waha:3000"
       WAHA_API_KEY: "BekoWahaKey_2025_Abidjan_9xPqL7vT2"
-
+     
       # URL n8n
       N8N_COMMAND_BOT_URL: "https://n8n.srv853938.hstgr.cloud/webhook/commandBot"
 
