@@ -28,6 +28,9 @@ import {
   createMerchantWithWaha,
   updateMerchantWahaConfig,
   updateCustomerProfile,
+  getLastOrderWithItemsForCustomer,
+  cancelLastOrderForCustomer,
+  loadLastOrderToCart,
 } from "./services/store.pg.js";
 
 import { callCommandBot } from "./services/commandbot.js";
@@ -286,6 +289,18 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const cart = await getCart(merchant.id, customer.id);
   const products = await getProductsForMerchant(merchant.id);
   const conversationState = await getConversationState(merchant.id, customer.id);
+  const context = { merchant, customer, overrideMessage: null };
+
+if (Array.isArray(agentOutput?.actions)) {
+  for (const action of agentOutput.actions) await applyAction(action, context);
+}
+
+const messageToSend = context.overrideMessage || agentOutput?.message;
+
+if (messageToSend) {
+  await sendWhatsappMessage({ merchant, chatId: replyChatId, to: from, text: messageToSend });
+}
+
 // ✅ 0) Si on collecte une info (nom, choix, tiers...), on traite sans IA
 const fast = await tryHandleStructuredReply({ merchant, customer, text, conversationState });
 if (fast.handled) {
@@ -330,6 +345,52 @@ if (fast.handled) {
   return agentOutput || { message: null, actions: [] };
 }
 
+
+function normalizeE164(input) {
+  if (!input) return null;
+  const digits = String(input).replace(/[^\d]/g, "");
+  return digits ? `+${digits}` : null;
+}
+
+// Parse très simple:
+// - "YYYY-MM-DD" ou "YYYY-MM-DD HH:mm"
+// - "DD/MM/YYYY" ou "DD/MM/YYYY HH:mm"
+// Sinon => null (tu redemandes une date au client)
+function parseDeliveryRequestedAt(rawText) {
+  if (!rawText) return null;
+  const s = String(rawText).trim();
+
+  // YYYY-MM-DD [HH:mm]
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]) - 1;
+    const day = Number(m[3]);
+    const hh = m[4] != null ? Number(m[4]) : 10;
+    const mm = m[5] != null ? Number(m[5]) : 0;
+    return new Date(year, month, day, hh, mm, 0, 0);
+  }
+
+  // DD/MM/YYYY [HH:mm]
+  m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  if (m) {
+    const day = Number(m[1]);
+    const month = Number(m[2]) - 1;
+    const year = Number(m[3]);
+    const hh = m[4] != null ? Number(m[4]) : 10;
+    const mm = m[5] != null ? Number(m[5]) : 0;
+    return new Date(year, month, day, hh, mm, 0, 0);
+  }
+
+  return null;
+}
+
+function isPastDate(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return true;
+  const now = new Date();
+  return d.getTime() < now.getTime();
+}
+
 // ================================
 // Actions IA
 // ================================
@@ -362,29 +423,140 @@ async function applyAction(action, context) {
       await updateCustomerField(merchant.id, customer.id, action.field, action.value);
       break;
 
-   case "CONFIRM_ORDER": {
-  // si on ne sait pas encore si c'est pour lui-même ou un tiers => demander
+  case "CONFIRM_ORDER": {
   const st = await getConversationState(merchant.id, customer.id);
 
+  // 1) On doit savoir si c'est pour lui ou un tiers
   if (!st?.recipient_mode) {
-    await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "recipient_mode" });
-    // on ne crée pas la commande tout de suite
-  } else if (st.recipient_mode === "self") {
+    await setConversationState(merchant.id, customer.id, {
+      step: "ASKING_INFO",
+      waiting_field: "recipient_mode",
+    });
+    break; // stop, on ne crée pas la commande
+  }
+
+  // 2) Date/heure de livraison obligatoire (dans tous les cas)
+  // On la stocke dans st.delivery_requested_raw (texte) puis on parse au moment de créer la commande
+  const deliveryRaw = st?.delivery_requested_raw;
+  if (!deliveryRaw) {
+    await setConversationState(merchant.id, customer.id, {
+      ...st,
+      step: "ASKING_INFO",
+      waiting_field: "delivery_datetime",
+    });
+    break;
+  }
+
+  const deliveryAt = parseDeliveryRequestedAt(deliveryRaw);
+  if (!deliveryAt || isPastDate(deliveryAt)) {
+    // date invalide ou passée => on redemande
+    await setConversationState(merchant.id, customer.id, {
+      ...st,
+      step: "ASKING_INFO",
+      waiting_field: "delivery_datetime",
+      delivery_requested_raw: null,
+    });
+    break;
+  }
+
+  // 3) Cas: commande pour lui-même
+  if (st.recipient_mode === "self") {
+    // Si son nom n'est pas renseigné => demander puis enregistrer via UPDATE_CUSTOMER (n8n) ou via ton handler de saisie
     if (!customer.name) {
-      await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "self_name", recipient_mode: "self" });
-    } else {
-      await createOrderFromCart(merchant.id, customer.id, { id: customer.id, name: customer.name, phone: customer.phone, address: customer.address || null });
-      await setConversationState(merchant.id, customer.id, {});
+      await setConversationState(merchant.id, customer.id, {
+        ...st,
+        step: "ASKING_INFO",
+        waiting_field: "name",
+        recipient_mode: "self",
+      });
+      break;
     }
-  } else if (st.recipient_mode === "third_party") {
-    // si l'IA a déjà rempli les infos dans st, on peut continuer via tryHandleStructuredReply
+
+    // Créer commande (destinataire = lui-même)
+    await createOrderFromCart(merchant.id, customer.id, {
+      recipientCustomerId: customer.id,
+      recipientNameSnapshot: customer.name,
+      recipientPhoneSnapshot: customer.phone || customer.phone_number || null,
+      recipientAddressSnapshot: customer.address || null,
+      deliveryRequestedAt: deliveryAt,
+      deliveryRequestedRaw: deliveryRaw,
+      status: "NEW",
+    });
+
+    await setConversationState(merchant.id, customer.id, {});
+    break;
+  }
+
+  // 4) Cas: commande pour une tierce personne
+  if (st.recipient_mode === "third_party") {
     if (!st.recipient_name) {
       await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_name" });
+      break;
     }
+    if (!st.recipient_phone) {
+      await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_phone" });
+      break;
+    }
+    if (!st.recipient_address) {
+      await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_address" });
+      break;
+    }
+
+    // Créer/chercher le "customer destinataire" en base (nouveau customer si absent)
+    const recipientPhone = normalizeE164(st.recipient_phone);
+    const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
+
+    // Optionnel: enrichir le destinataire en base
+    if (recipient && (!recipient.name || recipient.name !== st.recipient_name)) {
+      await updateCustomerField(merchant.id, recipient.id, "name", st.recipient_name);
+    }
+    if (recipient && st.recipient_address) {
+      await updateCustomerField(merchant.id, recipient.id, "address", st.recipient_address);
+    }
+
+    // Créer commande (payer = customer.id, destinataire = recipient.id)
+    await createOrderFromCart(merchant.id, customer.id, {
+      recipientCustomerId: recipient?.id || null,
+      recipientNameSnapshot: st.recipient_name,
+      recipientPhoneSnapshot: recipientPhone,
+      recipientAddressSnapshot: st.recipient_address,
+      deliveryRequestedAt: deliveryAt,
+      deliveryRequestedRaw: deliveryRaw,
+      status: "NEW",
+    });
+
+    await setConversationState(merchant.id, customer.id, {});
+    break;
   }
+
+  // fallback si valeur inconnue
+  await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "recipient_mode" });
   break;
 }
 
+case "SHOW_LAST_ORDER": {
+  const last = await getLastOrderWithItemsForCustomer(merchant.id, customer.id);
+  context.overrideMessage = last
+    ? `Votre dernière commande (#${last.order.id}) est **${last.order.status}**. Total: ${last.order.total_amount} ${last.order.currency}.`
+    : "Vous n’avez pas encore de commande.";
+  break;
+}
+
+case "CANCEL_LAST_ORDER": {
+  const result = await cancelLastOrderForCustomer(merchant.id, customer.id);
+  if (!result) context.overrideMessage = "Vous n’avez pas encore de commande à annuler.";
+  else if (result.blocked) context.overrideMessage = `Impossible d’annuler : ${result.reason}`;
+  else context.overrideMessage = `✅ D’accord. J’ai annulé votre commande (#${result.order.id}).`;
+  break;
+}
+
+case "MODIFY_LAST_ORDER": {
+  const result = await loadLastOrderToCart(merchant.id, customer.id);
+  if (!result) context.overrideMessage = "Vous n’avez pas encore de commande à modifier.";
+  else if (result.blocked) context.overrideMessage = `Impossible de modifier : ${result.reason}`;
+  else context.overrideMessage = "✅ Ok. J’ai remis votre dernière commande dans le panier. Vous pouvez ajouter/retirer des articles puis écrire *Je confirme*.";
+  break;
+}
 
     case "ASK_INFO":
       await setConversationState(merchant.id, customer.id, {

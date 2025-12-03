@@ -278,9 +278,24 @@ export async function clearCart(merchantId, customerId) {
 /* =========================
    Orders
 ========================= */
-export async function createOrderFromCart(merchantId, customerId, recipient) {
-  // recipient: { id, name, phone, address }  (peut être le customer lui-même)
+// ✅ Remplace ENTIEREMENT ta fonction createOrderFromCart par celle-ci
+export async function createOrderFromCart(merchantId, customerId, opts = {}) {
+  const {
+    // livraison
+    deliveryRequestedAt = null,      // JS Date ou null
+    deliveryRequestedRaw = null,     // string ou null
 
+    // destinataire (tierce personne)
+    recipientCustomerId = null,      // bigint/null
+    recipientNameSnapshot = null,
+    recipientPhoneSnapshot = null,
+    recipientAddressSnapshot = null,
+
+    // status initial
+    status = "NEW",
+  } = opts;
+
+  // 1) lire panier
   const cartRes = await query(
     `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price, p.name
      FROM cart_items ci
@@ -294,43 +309,56 @@ export async function createOrderFromCart(merchantId, customerId, recipient) {
   const totalAmount = items.reduce((sum, it) => sum + Number(it.total_price), 0);
   const currency = "XOF";
 
+  // 2) snapshot infos client (adresse / paiement)
   const customerRes = await query(
-    `SELECT address, payment_method FROM customers WHERE id=$1 AND merchant_id=$2`,
+    `SELECT address, payment_method, name, phone
+     FROM customers
+     WHERE id=$1 AND merchant_id=$2`,
     [customerId, merchantId]
   );
   const customerRow = customerRes.rows[0] || {};
+  const deliveryAddress = customerRow.address || null;
   const paymentMethodSnapshot = customerRow.payment_method || null;
 
+  // 3) créer la commande
   const orderRes = await query(
     `INSERT INTO orders (
-        merchant_id, customer_id, total_amount, currency, status,
+        merchant_id, customer_id,
+        total_amount, currency, status,
         delivery_address, payment_method_snapshot,
-        recipient_customer_id, recipient_name_snapshot, recipient_phone_snapshot, recipient_address_snapshot
+        recipient_customer_id,
+        recipient_name_snapshot, recipient_phone_snapshot, recipient_address_snapshot,
+        delivery_requested_at, delivery_requested_raw
      )
-     VALUES ($1,$2,$3,$4,'PENDING',$5,$6,$7,$8,$9,$10)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      RETURNING *`,
     [
       merchantId,
       customerId,
       totalAmount,
       currency,
-      // delivery_address : on met l'adresse du destinataire si dispo, sinon celle du customer
-      recipient?.address || customerRow.address || null,
+      status,
+      deliveryAddress,
       paymentMethodSnapshot,
-      recipient?.id || null,
-      recipient?.name || null,
-      recipient?.phone || null,
-      recipient?.address || null,
+
+      recipientCustomerId,
+      recipientNameSnapshot,
+      recipientPhoneSnapshot,
+      recipientAddressSnapshot,
+
+      deliveryRequestedAt,   // peut être Date ou null
+      deliveryRequestedRaw,
     ]
   );
 
   const order = orderRes.rows[0];
 
+  // 4) copier order_items
   const values = [];
   const params = [order.id];
 
   items.forEach((item, idx) => {
-    const base = idx * 4 + 2;
+    const base = idx * 4 + 2; // $2..$5 etc
     values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3})`);
     params.push(item.product_id, item.quantity, item.unit_price, item.total_price);
   });
@@ -341,10 +369,12 @@ export async function createOrderFromCart(merchantId, customerId, recipient) {
     params
   );
 
+  // 5) vider panier
   await query(`DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2`, [merchantId, customerId]);
 
   return { order, items };
 }
+
 
 export async function getOrdersForMerchant(merchantId) {
   const res = await query(
@@ -444,4 +474,78 @@ export async function updateCustomerProfile(merchantId, customerId, { name, addr
     [name ?? null, address ?? null, payment_method ?? null, customerId, merchantId]
   );
   return res.rows[0] || null;
+}
+
+export async function getLastOrderWithItemsForCustomer(merchantId, customerId) {
+  const orderRes = await query(
+    `SELECT *
+     FROM orders
+     WHERE merchant_id=$1 AND customer_id=$2
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [merchantId, customerId]
+  );
+  if (orderRes.rowCount === 0) return null;
+
+  const order = orderRes.rows[0];
+
+  const itemsRes = await query(
+    `SELECT oi.id, oi.product_id, oi.quantity, oi.unit_price, oi.total_price, p.name AS product_name
+     FROM order_items oi
+     JOIN products p ON p.id = oi.product_id
+     WHERE oi.order_id=$1
+     ORDER BY oi.id ASC`,
+    [order.id]
+  );
+
+  return { order, items: itemsRes.rows };
+}
+
+export async function cancelLastOrderForCustomer(merchantId, customerId) {
+  const last = await getLastOrderWithItemsForCustomer(merchantId, customerId);
+  if (!last) return null;
+
+  const currentStatus = last.order.status;
+  if (currentStatus === "DELIVERED" || currentStatus === "CANCELED") {
+    return { blocked: true, reason: `Commande non annulable (status=${currentStatus})`, order: last.order };
+  }
+
+  const res = await query(
+    `UPDATE orders
+     SET status='CANCELED'
+     WHERE id=$1 AND merchant_id=$2 AND customer_id=$3
+     RETURNING *`,
+    [last.order.id, merchantId, customerId]
+  );
+
+  return { blocked: false, order: res.rows[0] || null };
+}
+
+export async function loadLastOrderToCart(merchantId, customerId) {
+  const last = await getLastOrderWithItemsForCustomer(merchantId, customerId);
+  if (!last) return null;
+
+  const st = last.order.status;
+  if (st === "DELIVERED" || st === "CANCELED") {
+    return { blocked: true, reason: `Commande non modifiable (status=${st})`, order: last.order };
+  }
+
+  // vider panier actuel
+  await clearCart(merchantId, customerId);
+
+  // réinjecter items dans cart_items
+  for (const it of last.items) {
+    await query(
+      `INSERT INTO cart_items (merchant_id, customer_id, product_id, quantity, unit_price, total_price)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (merchant_id, customer_id, product_id)
+       DO UPDATE SET
+         quantity = EXCLUDED.quantity,
+         unit_price = EXCLUDED.unit_price,
+         total_price = EXCLUDED.total_price`,
+      [merchantId, customerId, it.product_id, it.quantity, it.unit_price, it.total_price]
+    );
+  }
+
+  return { blocked: false, order: last.order, items: last.items };
 }
