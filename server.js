@@ -31,6 +31,12 @@ import {
   getLastOrderWithItemsForCustomer,
   cancelLastOrderForCustomer,
   loadLastOrderToCart,
+  adminListMerchants,
+  adminSetMerchantSuspended,
+  adminGetDashboard,
+  adminAddSubscriptionPayment,
+  adminListSubscriptionPayments,
+  getMerchantAccessFlags,
 } from "./services/store.pg.js";
 
 import { callCommandBot } from "./services/commandbot.js";
@@ -131,16 +137,21 @@ function pickBusinessNumberFromPayload(root) {
 // ================================
 // Middlewares
 // ================================
-function adminMiddleware(req, res, next) {
-  const key = req.headers["x-admin-key"];
-  if (!process.env.ADMIN_KEY) {
-    return res.status(500).json({ error: "ADMIN_KEY non configuré côté serveur" });
+function adminAuthMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const [type, token] = authHeader.split(" ");
+  if (type !== "Bearer" || !token) return res.status(401).json({ error: "Token admin manquant" });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload?.role !== "admin") return res.status(403).json({ error: "Accès admin refusé" });
+    req.admin = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token admin invalide" });
   }
-  if (key !== process.env.ADMIN_KEY) {
-    return res.status(401).json({ error: "Admin key invalide" });
-  }
-  next();
 }
+
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -153,6 +164,13 @@ function authMiddleware(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.merchantId = payload.merchantId;
+    function requireSameMerchant(req, res, next) {
+  const merchantId = Number(req.params.merchantId);
+  if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+  if (req.merchantId !== merchantId) return res.status(403).json({ error: "Accès interdit (mauvais marchand)" });
+  next();
+}
+
     next();
   } catch (e) {
     console.error("Erreur JWT", e);
@@ -271,6 +289,20 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
 
   return { handled: false };
 }
+
+async function subscriptionGate(req, res, next) {
+  const merchantId = Number(req.params.merchantId);
+  const m = await getMerchantAccessFlags(merchantId);
+  if (!m) return res.status(404).json({ error: "Marchand introuvable" });
+
+  if (m.is_suspended) return res.status(403).json({ error: "Compte suspendu. Contactez l’admin." });
+
+  if (m.subscription_expires_at && new Date(m.subscription_expires_at).getTime() < Date.now()) {
+    return res.status(402).json({ error: "Abonnement expiré. Veuillez renouveler (15 000 FCFA / mois)." });
+  }
+  next();
+}
+
 
 // ================================
 // Healthcheck
@@ -731,7 +763,7 @@ app.put("/api/admin/merchants/:merchantId/waha", adminMiddleware, async (req, re
 // ================================
 // API Catalogue + Commandes
 // ================================
-app.get("/api/merchants/:merchantId/products", authMiddleware, async (req, res) => {
+app.get("/api/merchants/:merchantId/products", authMiddleware,  requireSameMerchant, subscriptionGate, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
     if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
@@ -744,7 +776,7 @@ app.get("/api/merchants/:merchantId/products", authMiddleware, async (req, res) 
   }
 });
 
-app.post("/api/merchants/:merchantId/products", authMiddleware, async (req, res) => {
+app.post("/api/merchants/:merchantId/products", authMiddleware, requireSameMerchant, subscriptionGate,  async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
     if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
@@ -827,7 +859,7 @@ app.delete(
   }
 );
 
-app.get("/api/merchants/:merchantId/orders", authMiddleware, async (req, res) => {
+app.get("/api/merchants/:merchantId/orders", authMiddleware,  requireSameMerchant, subscriptionGate, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
     if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
@@ -840,7 +872,7 @@ app.get("/api/merchants/:merchantId/orders", authMiddleware, async (req, res) =>
   }
 });
 
-app.get("/api/merchants/:merchantId/orders/:orderId", authMiddleware, async (req, res) => {
+app.get("/api/merchants/:merchantId/orders/:orderId", authMiddleware, requireSameMerchant, subscriptionGate,  async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
     const orderId = Number(req.params.orderId);
@@ -859,7 +891,7 @@ app.get("/api/merchants/:merchantId/orders/:orderId", authMiddleware, async (req
   }
 });
 
-app.put("/api/merchants/:merchantId/orders/:orderId/status", authMiddleware, async (req, res) => {
+app.put("/api/merchants/:merchantId/orders/:orderId/status", authMiddleware, requireSameMerchant, subscriptionGate,  async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
     const orderId = Number(req.params.orderId);
@@ -879,6 +911,102 @@ app.put("/api/merchants/:merchantId/orders/:orderId/status", authMiddleware, asy
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
+
+
+
+
+// ================================
+// Admin Auth (JWT)
+// ================================
+app.post("/api/admin/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const adminHash = process.env.ADMIN_PASSWORD_HASH;
+
+    if (!adminEmail || !adminHash) return res.status(500).json({ error: "ADMIN_EMAIL / ADMIN_PASSWORD_HASH non configurés" });
+    if (String(email).toLowerCase() !== String(adminEmail).toLowerCase()) return res.status(401).json({ error: "Identifiants invalides" });
+
+    const ok = await bcrypt.compare(password, adminHash);
+    if (!ok) return res.status(401).json({ error: "Identifiants invalides" });
+
+    const token = jwt.sign({ role: "admin", email: adminEmail }, JWT_SECRET, { expiresIn: "7d" });
+    return res.json({ token, admin: { email: adminEmail } });
+  } catch (e) {
+    console.error("Erreur /api/admin/login", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// ================================
+// Admin Dashboard
+// ================================
+app.get("/api/admin/dashboard", adminAuthMiddleware, async (req, res) => {
+  try {
+    const data = await adminGetDashboard();
+    return res.json(data);
+  } catch (e) {
+    console.error("Erreur GET /api/admin/dashboard", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// ================================
+// Admin Merchants
+// ================================
+app.get("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { q = null, status = null } = req.query || {};
+    const data = await adminListMerchants({ q, status });
+    return res.json(data);
+  } catch (e) {
+    console.error("Erreur GET /api/admin/merchants", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.put("/api/admin/merchants/:id/suspend", adminAuthMiddleware, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { is_suspended } = req.body || {};
+    const updated = await adminSetMerchantSuspended(id, !!is_suspended);
+    if (!updated) return res.status(404).json({ error: "Marchand introuvable" });
+    return res.json(updated);
+  } catch (e) {
+    console.error("Erreur PUT /api/admin/merchants/:id/suspend", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// paiement + prolongation
+app.post("/api/admin/merchants/:id/payments", adminAuthMiddleware, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { amount = 15000, months = 1, method = null, reference = null, note = null } = req.body || {};
+
+    const result = await adminAddSubscriptionPayment(id, { amount, months, method, reference, note });
+    if (!result) return res.status(404).json({ error: "Marchand introuvable" });
+
+    return res.json({ payment: result.payment, merchant: result.merchant });
+  } catch (e) {
+    console.error("Erreur POST /api/admin/merchants/:id/payments", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.get("/api/admin/merchants/:id/payments", adminAuthMiddleware, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const data = await adminListSubscriptionPayments(id);
+    return res.json(data);
+  } catch (e) {
+    console.error("Erreur GET /api/admin/merchants/:id/payments", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
 
 // ================================
 // Auth (login/register)

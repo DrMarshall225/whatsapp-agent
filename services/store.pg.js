@@ -549,3 +549,158 @@ export async function loadLastOrderToCart(merchantId, customerId) {
 
   return { blocked: false, order: last.order, items: last.items };
 }
+
+// =========================
+// Admin - Merchants / Subscriptions
+// =========================
+
+export async function adminListMerchants({ q = null, status = null } = {}) {
+  const params = [];
+  let where = "1=1";
+
+  if (q) {
+    params.push(`%${String(q).toLowerCase()}%`);
+    where += ` AND (
+      LOWER(name) LIKE $${params.length}
+      OR LOWER(email) LIKE $${params.length}
+      OR LOWER(COALESCE(whatsapp_number,'')) LIKE $${params.length}
+      OR LOWER(COALESCE(waha_session,'')) LIKE $${params.length}
+    )`;
+  }
+
+  // status attendu: ACTIVE | TRIAL | EXPIRED | SUSPENDED
+  if (status && status !== "ALL") {
+    params.push(status);
+    where += ` AND (
+      CASE
+        WHEN is_suspended = true THEN 'SUSPENDED'
+        WHEN subscription_expires_at IS NOT NULL AND subscription_expires_at < NOW() THEN 'EXPIRED'
+        WHEN subscription_status = 'ACTIVE' AND (subscription_expires_at IS NULL OR subscription_expires_at >= NOW()) THEN 'ACTIVE'
+        ELSE 'TRIAL'
+      END
+    ) = $${params.length}`;
+  }
+
+  const sql = `
+    SELECT
+      id, name, email, whatsapp_number, waha_session,
+      subscription_status, subscription_expires_at, is_suspended,
+      CASE
+        WHEN is_suspended = true THEN 'SUSPENDED'
+        WHEN subscription_expires_at IS NOT NULL AND subscription_expires_at < NOW() THEN 'EXPIRED'
+        WHEN subscription_status = 'ACTIVE' AND (subscription_expires_at IS NULL OR subscription_expires_at >= NOW()) THEN 'ACTIVE'
+        ELSE 'TRIAL'
+      END AS computed_status
+    FROM merchants
+    WHERE ${where}
+    ORDER BY id DESC
+  `;
+  const res = await query(sql, params);
+  return res.rows;
+}
+
+export async function adminSetMerchantSuspended(merchantId, isSuspended) {
+  const res = await query(
+    `UPDATE merchants
+     SET is_suspended = $2
+     WHERE id = $1
+     RETURNING id, name, email, whatsapp_number, waha_session,
+               subscription_status, subscription_expires_at, is_suspended`,
+    [Number(merchantId), !!isSuspended]
+  );
+  return res.rows[0] || null;
+}
+
+export async function adminGetDashboard() {
+  const counts = await query(`
+    SELECT
+      COUNT(*)::int AS total_merchants,
+      SUM(CASE WHEN is_suspended = true THEN 1 ELSE 0 END)::int AS suspended_merchants,
+      SUM(CASE WHEN subscription_expires_at IS NOT NULL AND subscription_expires_at < NOW() THEN 1 ELSE 0 END)::int AS expired_merchants,
+      SUM(CASE WHEN is_suspended = false AND subscription_status='ACTIVE' AND (subscription_expires_at IS NULL OR subscription_expires_at >= NOW()) THEN 1 ELSE 0 END)::int AS active_merchants
+    FROM merchants
+  `);
+
+  const revenue = await query(`
+    SELECT COALESCE(SUM(amount),0)::int AS revenue_month
+    FROM subscription_payments
+    WHERE date_trunc('month', paid_at) = date_trunc('month', now())
+  `);
+
+  return {
+    ...counts.rows[0],
+    revenue_month: revenue.rows[0]?.revenue_month || 0,
+  };
+}
+
+export async function adminAddSubscriptionPayment(merchantId, { amount = 15000, months = 1, method = null, reference = null, note = null } = {}) {
+  const id = Number(merchantId);
+  const m = Math.max(1, Number(months || 1));
+  const amt = Number(amount || 15000);
+
+  // point de départ: si abonnement encore valide -> on prolonge à partir de expiration, sinon à partir d'aujourd'hui
+  const merchRes = await query(
+    `SELECT subscription_expires_at FROM merchants WHERE id=$1`,
+    [id]
+  );
+  if (merchRes.rowCount === 0) return null;
+
+  const expiresAt = merchRes.rows[0].subscription_expires_at;
+  const startDateSql = expiresAt && new Date(expiresAt).getTime() > Date.now()
+    ? "DATE($1::timestamptz) + INTERVAL '1 day'"
+    : "CURRENT_DATE";
+
+  // period_start / period_end
+  const periodRes = await query(
+    `SELECT
+      (${startDateSql})::date AS period_start,
+      ((${startDateSql}) + ($2 || ' month')::interval - INTERVAL '1 day')::date AS period_end`,
+    expiresAt && new Date(expiresAt).getTime() > Date.now()
+      ? [expiresAt, String(m)]
+      : [null, String(m)]
+  );
+
+  const period_start = periodRes.rows[0].period_start;
+  const period_end = periodRes.rows[0].period_end;
+
+  const payRes = await query(
+    `INSERT INTO subscription_payments(merchant_id, amount, currency, period_start, period_end, method, reference, note)
+     VALUES($1,$2,'XOF',$3,$4,$5,$6,$7)
+     RETURNING *`,
+    [id, amt, period_start, period_end, method, reference, note]
+  );
+
+  // on met le merchant en ACTIVE + expiration fin de journée
+  const updated = await query(
+    `UPDATE merchants
+     SET subscription_status='ACTIVE',
+         subscription_expires_at = ($2::date + time '23:59:59')::timestamptz,
+         is_suspended = false
+     WHERE id=$1
+     RETURNING id, name, email, whatsapp_number, waha_session,
+               subscription_status, subscription_expires_at, is_suspended`,
+    [id, period_end]
+  );
+
+  return { payment: payRes.rows[0], merchant: updated.rows[0] };
+}
+
+export async function adminListSubscriptionPayments(merchantId) {
+  const res = await query(
+    `SELECT *
+     FROM subscription_payments
+     WHERE merchant_id=$1
+     ORDER BY paid_at DESC`,
+    [Number(merchantId)]
+  );
+  return res.rows;
+}
+
+export async function getMerchantAccessFlags(merchantId) {
+  const res = await query(
+    `SELECT id, is_suspended, subscription_expires_at, subscription_status
+     FROM merchants WHERE id=$1`,
+    [Number(merchantId)]
+  );
+  return res.rows[0] || null;
+}
