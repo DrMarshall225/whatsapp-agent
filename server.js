@@ -750,6 +750,18 @@ app.post("/webhook/waha", async (req, res) => {
 // Body: { whatsapp_number, waha_session }
 // Header: x-admin-key: ...
 // ================================
+
+app.get("/api/admin/dashboard", adminAuthMiddleware, async (req, res) => {
+  return res.json({
+    total_merchants: 0,
+    active_merchants: 0,
+    expired_merchants: 0,
+    suspended_merchants: 0,
+    revenue_month: 0,
+  });
+});
+
+
 app.put("/api/admin/merchants/:merchantId/waha", adminMiddleware, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
