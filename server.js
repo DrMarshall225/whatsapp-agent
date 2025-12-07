@@ -137,21 +137,6 @@ function pickBusinessNumberFromPayload(root) {
 // ================================
 // Middlewares
 // ================================
-function adminAuthMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  const [type, token] = authHeader.split(" ");
-  if (type !== "Bearer" || !token) return res.status(401).json({ error: "Token admin manquant" });
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload?.role !== "admin") return res.status(403).json({ error: "Accès admin refusé" });
-    req.admin = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Token admin invalide" });
-  }
-}
-
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -177,6 +162,39 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: "Token invalide" });
   }
 }
+
+
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@local";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123"; // simple pour dev
+
+function adminAuthMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const [type, token] = authHeader.split(" ");
+  if (type !== "Bearer" || !token) return res.status(401).json({ error: "Token admin manquant" });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.role !== "admin") return res.status(403).json({ error: "Accès refusé" });
+    req.admin = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token admin invalide" });
+  }
+}
+
+// LOGIN ADMIN
+app.post("/api/admin/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
+
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Identifiants admin invalides" });
+  }
+
+  const token = jwt.sign({ role: "admin", email }, JWT_SECRET, { expiresIn: "7d" });
+  return res.json({ token, admin: { email } });
+});
+
 
 
 function looksLikeYes(msg) {
