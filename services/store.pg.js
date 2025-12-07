@@ -98,7 +98,6 @@ export async function createMerchantWithWaha({ name, email, passwordHash, whatsa
 export async function updateMerchantWahaConfig(merchantId, { whatsappNumber, wahaSession }) {
   const id = Number(merchantId);
 
-  // ⚠️ Important: COALESCE($2, whatsapp_number) => si $2 est null, pas de changement
   const n = whatsappNumber !== undefined ? normalizeE164(whatsappNumber) : null;
   const s = wahaSession !== undefined ? normalizeSession(wahaSession) : null;
 
@@ -205,19 +204,38 @@ export async function getConversationState(merchantId, customerId) {
      WHERE merchant_id=$1 AND customer_id=$2 LIMIT 1`,
     [merchantId, customerId]
   );
+  // pg retourne jsonb déjà en objet JS
   return res.rows[0]?.state || {};
 }
 
+/**
+ * ✅ setConversationState — MERGE JSONB + RESET quand {} est passé
+ *
+ * - Si tu envoies state = {} => reset complet (state = {})
+ * - Sinon => merge : old_state || patch_state
+ */
 export async function setConversationState(merchantId, customerId, state) {
+  const patch = state && typeof state === "object" ? state : {};
+  const patchJson = JSON.stringify(patch);
+
   const res = await query(
-    `INSERT INTO conversation_states (merchant_id, customer_id, state)
-     VALUES ($1,$2,$3::jsonb)
-     ON CONFLICT (merchant_id, customer_id)
-     DO UPDATE SET state=EXCLUDED.state
-     RETURNING state`,
-    [merchantId, customerId, JSON.stringify(state)]
+    `
+    INSERT INTO conversation_states (merchant_id, customer_id, state)
+    VALUES ($1,$2,$3::jsonb)
+    ON CONFLICT (merchant_id, customer_id)
+    DO UPDATE SET state =
+      CASE
+        WHEN jsonb_typeof(EXCLUDED.state) = 'object'
+         AND jsonb_object_length(EXCLUDED.state) = 0
+          THEN '{}'::jsonb
+        ELSE COALESCE(conversation_states.state, '{}'::jsonb) || EXCLUDED.state
+      END
+    RETURNING state
+    `,
+    [merchantId, customerId, patchJson]
   );
-  return res.rows[0].state;
+
+  return res.rows[0]?.state || {};
 }
 
 /* =========================
@@ -281,17 +299,14 @@ export async function clearCart(merchantId, customerId) {
 // ✅ Remplace ENTIEREMENT ta fonction createOrderFromCart par celle-ci
 export async function createOrderFromCart(merchantId, customerId, opts = {}) {
   const {
-    // livraison
-    deliveryRequestedAt = null,      // JS Date ou null
-    deliveryRequestedRaw = null,     // string ou null
+    deliveryRequestedAt = null,
+    deliveryRequestedRaw = null,
 
-    // destinataire (tierce personne)
-    recipientCustomerId = null,      // bigint/null
+    recipientCustomerId = null,
     recipientNameSnapshot = null,
     recipientPhoneSnapshot = null,
     recipientAddressSnapshot = null,
 
-    // status initial
     status = "NEW",
   } = opts;
 
@@ -346,7 +361,7 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
       recipientPhoneSnapshot,
       recipientAddressSnapshot,
 
-      deliveryRequestedAt,   // peut être Date ou null
+      deliveryRequestedAt,
       deliveryRequestedRaw,
     ]
   );
@@ -358,7 +373,7 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
   const params = [order.id];
 
   items.forEach((item, idx) => {
-    const base = idx * 4 + 2; // $2..$5 etc
+    const base = idx * 4 + 2;
     values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3})`);
     params.push(item.product_id, item.quantity, item.unit_price, item.total_price);
   });
@@ -374,7 +389,6 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
 
   return { order, items };
 }
-
 
 export async function getOrdersForMerchant(merchantId) {
   const res = await query(
@@ -568,7 +582,6 @@ export async function adminListMerchants({ q = null, status = null } = {}) {
     )`;
   }
 
-  // status attendu: ACTIVE | TRIAL | EXPIRED | SUSPENDED
   if (status && status !== "ALL") {
     params.push(status);
     where += ` AND (
@@ -633,12 +646,14 @@ export async function adminGetDashboard() {
   };
 }
 
-export async function adminAddSubscriptionPayment(merchantId, { amount = 15000, months = 1, method = null, reference = null, note = null } = {}) {
+export async function adminAddSubscriptionPayment(
+  merchantId,
+  { amount = 15000, months = 1, method = null, reference = null, note = null } = {}
+) {
   const id = Number(merchantId);
   const m = Math.max(1, Number(months || 1));
   const amt = Number(amount || 15000);
 
-  // point de départ: si abonnement encore valide -> on prolonge à partir de expiration, sinon à partir d'aujourd'hui
   const merchRes = await query(
     `SELECT subscription_expires_at FROM merchants WHERE id=$1`,
     [id]
@@ -646,18 +661,17 @@ export async function adminAddSubscriptionPayment(merchantId, { amount = 15000, 
   if (merchRes.rowCount === 0) return null;
 
   const expiresAt = merchRes.rows[0].subscription_expires_at;
-  const startDateSql = expiresAt && new Date(expiresAt).getTime() > Date.now()
+  const isStillValid = expiresAt && new Date(expiresAt).getTime() > Date.now();
+
+  const startDateSql = isStillValid
     ? "DATE($1::timestamptz) + INTERVAL '1 day'"
     : "CURRENT_DATE";
 
-  // period_start / period_end
   const periodRes = await query(
     `SELECT
       (${startDateSql})::date AS period_start,
       ((${startDateSql}) + ($2 || ' month')::interval - INTERVAL '1 day')::date AS period_end`,
-    expiresAt && new Date(expiresAt).getTime() > Date.now()
-      ? [expiresAt, String(m)]
-      : [null, String(m)]
+    isStillValid ? [expiresAt, String(m)] : [null, String(m)]
   );
 
   const period_start = periodRes.rows[0].period_start;
@@ -670,7 +684,6 @@ export async function adminAddSubscriptionPayment(merchantId, { amount = 15000, 
     [id, amt, period_start, period_end, method, reference, note]
   );
 
-  // on met le merchant en ACTIVE + expiration fin de journée
   const updated = await query(
     `UPDATE merchants
      SET subscription_status='ACTIVE',

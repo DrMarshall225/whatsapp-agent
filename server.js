@@ -66,7 +66,98 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // ex: admin@dido.com
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt hash
 
 // ================================
-// Helpers
+// Helpers (Validation & Anti-ACK)
+// ================================
+const ACK_WORDS = new Set([
+  "ok",
+  "okay",
+  "oui",
+  "yes",
+  "y",
+  "d'accord",
+  "daccord",
+  "dac",
+  "ça marche",
+  "ca marche",
+  "c'est bon",
+  "cest bon",
+  "vas-y",
+  "vas y",
+  "go",
+  "bien",
+  "👍",
+  "👌",
+]);
+
+function normText(s) {
+  return (s || "").toString().trim().toLowerCase();
+}
+
+function isAckValue(val) {
+  const t = normText(val);
+  if (!t) return true;
+  return ACK_WORDS.has(t);
+}
+
+function lettersCount(str) {
+  return ((str || "").match(/[A-Za-zÀ-ÿ]/g) || []).length;
+}
+
+function looksLikeName(val) {
+  if (isAckValue(val)) return false;
+  const v = (val || "").toString().trim();
+  return v.length >= 2 && lettersCount(v) >= 2;
+}
+
+function looksLikeAddress(val) {
+  if (isAckValue(val)) return false;
+  const v = (val || "").toString().trim();
+  return v.length >= 6 && lettersCount(v) >= 2;
+}
+
+function looksLikePhone(val) {
+  if (isAckValue(val)) return false;
+  const digits = (val || "").toString().replace(/\D/g, "");
+  return digits.length >= 8;
+}
+
+function looksLikeDelivery(val) {
+  if (isAckValue(val)) return false;
+  const t = normText(val);
+  // Indices simples (tu peux enrichir au besoin)
+  return (
+    /\d{4}-\d{2}-\d{2}/.test(t) ||
+    /\d{2}\/\d{2}\/\d{4}/.test(t) ||
+    /\b(demain|aujourd|auj|ce soir|cet|dans)\b/.test(t) ||
+    /\b(\d{1,2}h|\d{1,2}:\d{2})\b/.test(t)
+  );
+}
+
+function validateField(field, value) {
+  switch (field) {
+    case "name":
+    case "self_name":
+    case "recipient_name":
+      return looksLikeName(value);
+    case "address":
+    case "recipient_address":
+      return looksLikeAddress(value);
+    case "phone":
+    case "recipient_phone":
+      return looksLikePhone(value);
+    case "delivery_requested_raw":
+      return looksLikeDelivery(value);
+    case "recipient_mode":
+      // traité séparément (1/2/moi/autre)
+      return !isAckValue(value) && normText(value).length > 0;
+    default:
+      // Refuser ACK par défaut
+      return !isAckValue(value);
+  }
+}
+
+// ================================
+// Helpers (Phones / WAHA)
 // ================================
 function normalizePhone(phone) {
   if (!phone) return null;
@@ -149,6 +240,11 @@ function isPastDate(d) {
   return d.getTime() < Date.now();
 }
 
+function isReactivationMessage(text) {
+  const t = normText(text);
+  return ["start", "reprends", "recommence", "continue"].some((k) => t === k || t.includes(k));
+}
+
 // ================================
 // Middlewares
 // ================================
@@ -214,15 +310,32 @@ function adminAuthMiddleware(req, res, next) {
 }
 
 // ================================
-// Structured replies (sans IA)
+// Structured replies (sans IA) - CORRIGÉ
 // ================================
-function looksLikeYes(msg) {
-  const s = String(msg || "").trim().toLowerCase();
-  return ["1", "oui", "ouais", "y", "yes", "moi", "pour moi", "c'est moi", "meme"].some((k) => s.includes(k));
+function looksLikeRecipientSelf(msg) {
+  const s = normText(msg);
+  return (
+    s === "1" ||
+    s.includes("moi") ||
+    s.includes("pour moi") ||
+    s.includes("c'est pour moi") ||
+    s.includes("cest pour moi") ||
+    s.includes("moi-même") ||
+    s.includes("moi meme")
+  );
 }
-function looksLikeNo(msg) {
-  const s = String(msg || "").trim().toLowerCase();
-  return ["2", "non", "autre", "tiers", "tierce", "quelqu'un", "quelquun", "pour lui", "pour elle"].some((k) => s.includes(k));
+
+function looksLikeRecipientThird(msg) {
+  const s = normText(msg);
+  return (
+    s === "2" ||
+    s.includes("autre") ||
+    s.includes("tier") ||
+    s.includes("tierce") ||
+    s.includes("quelqu") ||
+    s.includes("pour lui") ||
+    s.includes("pour elle")
+  );
 }
 
 async function tryHandleStructuredReply({ merchant, customer, text, conversationState }) {
@@ -232,8 +345,24 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
   const clean = String(text || "").trim();
   if (!clean) return { handled: true, message: "Je n’ai pas bien reçu. Peux-tu répéter ?" };
 
-  // Date de livraison
-  if (waiting === "delivery_datetime") {
+  // Si ACK alors on redemande la vraie valeur (important)
+  if (isAckValue(clean) && ["name", "self_name", "recipient_name", "recipient_address", "recipient_phone", "delivery_requested_raw"].includes(waiting)) {
+    const mapMsg = {
+      name: "Quel est votre **nom complet** ? (ex : “KONE Aïcha”)",
+      self_name: "Quel est votre **nom complet** ? (ex : “KONE Aïcha”)",
+      recipient_name: "Quel est le **nom complet** du destinataire ? (ex : “KONE Aïcha”)",
+      recipient_phone: "Quel est le **numéro WhatsApp** du destinataire ? (ex : 225XXXXXXXXXX)",
+      recipient_address: "Quelle est l’**adresse complète** du destinataire ? (ex : “Cocody Angré …”)",
+      delivery_requested_raw: "Donnez la **date/heure de livraison** (ex : 2025-12-10 14:30).",
+    };
+    return { handled: true, message: mapMsg[waiting] || "Je vous écoute 🙂 Peux-tu préciser ?" };
+  }
+
+  // Date/heure de livraison (HARMONISÉE)
+  if (waiting === "delivery_requested_raw") {
+    if (!validateField("delivery_requested_raw", clean)) {
+      return { handled: true, message: "Format non valide. Exemple : *2025-12-10 14:30* ou *10/12/2025 14:30*." };
+    }
     await setConversationState(merchant.id, customer.id, {
       ...conversationState,
       delivery_requested_raw: clean,
@@ -245,27 +374,36 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
     };
   }
 
-  // Nom (si demandé)
+  // Nom (self)
   if (waiting === "name" || waiting === "self_name") {
+    if (!validateField("name", clean)) {
+      return { handled: true, message: "J’ai besoin de votre **nom complet** (ex : “KONE Aïcha”)." };
+    }
     await updateCustomerField(merchant.id, customer.id, "name", clean);
     await setConversationState(merchant.id, customer.id, { ...conversationState, waiting_field: null });
     return { handled: true, message: `Merci ${clean} ✅. Écris *Je confirme* pour valider.` };
   }
 
-  // Choix : pour moi / pour quelqu'un d'autre
+  // Choix destinataire : 1/2/moi/autre
   if (waiting === "recipient_mode") {
-    if (looksLikeYes(clean)) {
+    if (isAckValue(clean)) {
+      return { handled: true, message: "Réponds : *1* = pour toi-même, *2* = pour une autre personne." };
+    }
+    if (looksLikeRecipientSelf(clean)) {
       const nextState = { ...conversationState, recipient_mode: "self", waiting_field: null, step: null };
       await setConversationState(merchant.id, customer.id, nextState);
 
       if (!customer.name) {
         await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "name" });
-        return { handled: true, message: "D’accord 😊. Quel est ton nom (et prénom) ?" };
+        return { handled: true, message: "D’accord 🙂 Quel est votre nom (et prénom) ?" };
       }
-      return { handled: true, message: "Parfait ✅. Donne-moi la *date/heure de livraison* (ex: 2025-12-10 14:30)." };
+
+      // ensuite livraison
+      await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "delivery_requested_raw" });
+      return { handled: true, message: "Parfait ✅. Donnez-moi la *date/heure de livraison* (ex: 2025-12-10 14:30)." };
     }
 
-    if (looksLikeNo(clean)) {
+    if (looksLikeRecipientThird(clean)) {
       const nextState = { ...conversationState, recipient_mode: "third_party", waiting_field: "recipient_name", step: "ASKING_INFO" };
       await setConversationState(merchant.id, customer.id, nextState);
       return { handled: true, message: "Très bien. Donne-moi le *nom et prénom* du destinataire." };
@@ -276,6 +414,9 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
 
   // Tiers : nom
   if (waiting === "recipient_name") {
+    if (!validateField("recipient_name", clean)) {
+      return { handled: true, message: "J’ai besoin du **nom complet** du destinataire (ex : “KONE Aïcha”)." };
+    }
     const nextState = { ...conversationState, recipient_name: clean, waiting_field: "recipient_phone", step: "ASKING_INFO" };
     await setConversationState(merchant.id, customer.id, nextState);
     return { handled: true, message: "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX)." };
@@ -283,8 +424,11 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
 
   // Tiers : téléphone
   if (waiting === "recipient_phone") {
+    if (!validateField("recipient_phone", clean)) {
+      return { handled: true, message: "Numéro invalide. Envoie le numéro au format: *225XXXXXXXXXX*." };
+    }
     const phone = normalizePhone(clean);
-    if (!phone) return { handled: true, message: "Numéro invalide. Envoie le numéro au format: 225XXXXXXXXXX" };
+    if (!phone) return { handled: true, message: "Numéro invalide. Envoie le numéro au format: *225XXXXXXXXXX*." };
 
     const nextState = { ...conversationState, recipient_phone: phone, waiting_field: "recipient_address", step: "ASKING_INFO" };
     await setConversationState(merchant.id, customer.id, nextState);
@@ -293,6 +437,9 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
 
   // Tiers : adresse
   if (waiting === "recipient_address") {
+    if (!validateField("recipient_address", clean)) {
+      return { handled: true, message: "J’ai besoin d’une **adresse complète** (ex : “Cocody Angré 8e tranche …”)." };
+    }
     const nextState = { ...conversationState, recipient_address: clean, waiting_field: null };
     await setConversationState(merchant.id, customer.id, nextState);
     return { handled: true, message: "Merci ✅. Maintenant écris *Je confirme* pour valider la commande." };
@@ -309,7 +456,7 @@ app.get("/", (req, res) => {
 });
 
 // ================================
-// Actions IA
+// Actions IA (CORRIGÉ)
 // ================================
 async function applyAction(action, ctx) {
   const { merchant, customer } = ctx;
@@ -327,17 +474,54 @@ async function applyAction(action, ctx) {
       await clearCart(merchant.id, customer.id);
       return;
 
-    case "SET_STATE":
-      await setConversationState(merchant.id, customer.id, action.state || {});
-      return;
+    case "SET_STATE": {
+      const patch = action.state || {};
+      const keys = Object.keys(patch);
 
-    case "UPDATE_CUSTOMER":
-      await updateCustomerField(merchant.id, customer.id, action.field, action.value);
-      return;
+      // ✅ si state vide => reset complet (comme dans le prompt)
+      if (keys.length === 0) {
+        await setConversationState(merchant.id, customer.id, {});
+        return;
+      }
 
-    case "ASK_INFO":
-      await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: action.field });
+      // ✅ sinon merge pour ne pas perdre last_question/pending_add_to_cart
+      const st = await getConversationState(merchant.id, customer.id);
+      await setConversationState(merchant.id, customer.id, { ...(st || {}), ...patch });
       return;
+    }
+
+    case "UPDATE_CUSTOMER": {
+      const val = (action.value || "").toString().trim();
+
+      // ✅ anti-bug : refuse ACK et valeurs non plausibles
+      if (!validateField(action.field, val)) {
+        // forcer la question claire
+        const st = await getConversationState(merchant.id, customer.id);
+        await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: action.field });
+
+        ctx.overrideMessage =
+          action.field === "name"
+            ? "Parfait 🙂 Quel est votre **nom complet** ? (ex : “KONE Aïcha”)"
+            : action.field === "address"
+            ? "D’accord 🙂 Quelle est votre **adresse complète** ? (ex : “Cocody Angré 8e tranche …”)"
+            : "Je vous écoute 🙂 Pouvez-vous préciser ?";
+        return;
+      }
+
+      await updateCustomerField(merchant.id, customer.id, action.field, val);
+      return;
+    }
+
+    case "ASK_INFO": {
+      // ✅ merge state (ne pas écraser last_question/pending_add_to_cart)
+      const st = await getConversationState(merchant.id, customer.id);
+      await setConversationState(merchant.id, customer.id, {
+        ...(st || {}),
+        step: "ASKING_INFO",
+        waiting_field: action.field,
+      });
+      return;
+    }
 
     case "SHOW_LAST_ORDER": {
       const last = await getLastOrderWithItemsForCustomer(merchant.id, customer.id);
@@ -367,22 +551,23 @@ async function applyAction(action, ctx) {
       const st = await getConversationState(merchant.id, customer.id);
 
       if (!st?.recipient_mode) {
-        await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "recipient_mode" });
+        await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
         return;
       }
 
       const deliveryRaw = st?.delivery_requested_raw;
       if (!deliveryRaw) {
-        await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "delivery_datetime" });
+        // ✅ harmonisé
+        await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "delivery_requested_raw" });
         return;
       }
 
       const deliveryAt = parseDeliveryRequestedAt(deliveryRaw);
       if (!deliveryAt || isPastDate(deliveryAt)) {
         await setConversationState(merchant.id, customer.id, {
-          ...st,
+          ...(st || {}),
           step: "ASKING_INFO",
-          waiting_field: "delivery_datetime",
+          waiting_field: "delivery_requested_raw",
           delivery_requested_raw: null,
         });
         return;
@@ -391,7 +576,7 @@ async function applyAction(action, ctx) {
       // self
       if (st.recipient_mode === "self") {
         if (!customer.name) {
-          await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
           return;
         }
 
@@ -413,15 +598,15 @@ async function applyAction(action, ctx) {
       // third party
       if (st.recipient_mode === "third_party") {
         if (!st.recipient_name) {
-          await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_name" });
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_name" });
           return;
         }
         if (!st.recipient_phone) {
-          await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_phone" });
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_phone" });
           return;
         }
         if (!st.recipient_address) {
-          await setConversationState(merchant.id, customer.id, { ...st, step: "ASKING_INFO", waiting_field: "recipient_address" });
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_address" });
           return;
         }
 
@@ -446,7 +631,7 @@ async function applyAction(action, ctx) {
         return;
       }
 
-      await setConversationState(merchant.id, customer.id, { step: "ASKING_INFO", waiting_field: "recipient_mode" });
+      await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
       return;
     }
 
@@ -461,8 +646,12 @@ async function applyAction(action, ctx) {
 // ================================
 async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const customer = await findOrCreateCustomer(merchant.id, from);
-
   const conversationState = await getConversationState(merchant.id, customer.id);
+
+  // ✅ silence si opt-out déjà activé (sauf réactivation)
+  if (conversationState?.opted_out && !isReactivationMessage(text)) {
+    return { message: null, actions: [] };
+  }
 
   // ✅ 1) Réponses structurées (sans IA)
   const structured = await tryHandleStructuredReply({ merchant, customer, text, conversationState });
@@ -513,6 +702,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 
   const outgoingMsg = (ctx.overrideMessage || agentOutput?.message || "").toString().trim();
 
+  // ✅ si message vide => ne rien envoyer (utile pour STOP)
   if (outgoingMsg) {
     await sendWhatsappMessage({
       merchant,
@@ -663,165 +853,123 @@ app.post("/api/auth/register", async (req, res) => {
 // ================================
 // Merchant API (products/orders) - protégée
 // ================================
-app.get(
-  "/api/merchants/:merchantId/products",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const products = await getProductsForMerchant(merchantId);
-      return res.json(products);
-    } catch (e) {
-      console.error("Erreur GET products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+app.get("/api/merchants/:merchantId/products", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const products = await getProductsForMerchant(merchantId);
+    return res.json(products);
+  } catch (e) {
+    console.error("Erreur GET products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
-app.post(
-  "/api/merchants/:merchantId/products",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const { name, price, description, currency, code, category, image_url } = req.body || {};
+app.post("/api/merchants/:merchantId/products", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const { name, price, description, currency, code, category, image_url } = req.body || {};
 
-      if (!name || price == null) return res.status(400).json({ error: "Les champs 'name' et 'price' sont obligatoires." });
+    if (!name || price == null) return res.status(400).json({ error: "Les champs 'name' et 'price' sont obligatoires." });
 
-      const product = await createProductForMerchant(merchantId, {
-        name,
-        price,
-        description,
-        currency,
-        code,
-        category,
-        image_url,
-      });
+    const product = await createProductForMerchant(merchantId, {
+      name,
+      price,
+      description,
+      currency,
+      code,
+      category,
+      image_url,
+    });
 
-      return res.status(201).json(product);
-    } catch (e) {
-      console.error("Erreur POST products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+    return res.status(201).json(product);
+  } catch (e) {
+    console.error("Erreur POST products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
-app.put(
-  "/api/merchants/:merchantId/products/:productId",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const productId = Number(req.params.productId);
+app.put("/api/merchants/:merchantId/products/:productId", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const productId = Number(req.params.productId);
 
-      const { name, price, description, currency, code, category, image_url, is_active } = req.body || {};
-      if (!name || price == null) return res.status(400).json({ error: "Les champs 'name' et 'price' sont obligatoires." });
+    const { name, price, description, currency, code, category, image_url, is_active } = req.body || {};
+    if (!name || price == null) return res.status(400).json({ error: "Les champs 'name' et 'price' sont obligatoires." });
 
-      const updated = await updateProductForMerchant(merchantId, productId, {
-        name,
-        description,
-        price,
-        currency,
-        code,
-        category,
-        image_url,
-        is_active,
-      });
+    const updated = await updateProductForMerchant(merchantId, productId, {
+      name,
+      description,
+      price,
+      currency,
+      code,
+      category,
+      image_url,
+      is_active,
+    });
 
-      if (!updated) return res.status(404).json({ error: "Produit non trouvé pour ce marchand" });
-      return res.json(updated);
-    } catch (e) {
-      console.error("Erreur PUT products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+    if (!updated) return res.status(404).json({ error: "Produit non trouvé pour ce marchand" });
+    return res.json(updated);
+  } catch (e) {
+    console.error("Erreur PUT products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
-app.delete(
-  "/api/merchants/:merchantId/products/:productId",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const productId = Number(req.params.productId);
+app.delete("/api/merchants/:merchantId/products/:productId", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const productId = Number(req.params.productId);
 
-      await deleteProductForMerchant(merchantId, productId);
-      return res.status(204).send();
-    } catch (e) {
-      console.error("Erreur DELETE products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+    await deleteProductForMerchant(merchantId, productId);
+    return res.status(204).send();
+  } catch (e) {
+    console.error("Erreur DELETE products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
-app.get(
-  "/api/merchants/:merchantId/orders",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const orders = await getOrdersForMerchant(merchantId);
-      return res.json(orders);
-    } catch (e) {
-      console.error("Erreur GET orders", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+app.get("/api/merchants/:merchantId/orders", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const orders = await getOrdersForMerchant(merchantId);
+    return res.json(orders);
+  } catch (e) {
+    console.error("Erreur GET orders", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
-app.get(
-  "/api/merchants/:merchantId/orders/:orderId",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const orderId = Number(req.params.orderId);
+app.get("/api/merchants/:merchantId/orders/:orderId", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const orderId = Number(req.params.orderId);
 
-      const data = await getOrderWithItems(merchantId, orderId);
-      if (!data) return res.status(404).json({ error: "Commande introuvable" });
+    const data = await getOrderWithItems(merchantId, orderId);
+    if (!data) return res.status(404).json({ error: "Commande introuvable" });
 
-      return res.json(data);
-    } catch (e) {
-      console.error("Erreur GET order detail", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+    return res.json(data);
+  } catch (e) {
+    console.error("Erreur GET order detail", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
-app.put(
-  "/api/merchants/:merchantId/orders/:orderId/status",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const orderId = Number(req.params.orderId);
-      const { status } = req.body || {};
-      if (!status) return res.status(400).json({ error: "Le champ 'status' est obligatoire." });
+app.put("/api/merchants/:merchantId/orders/:orderId/status", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const orderId = Number(req.params.orderId);
+    const { status } = req.body || {};
+    if (!status) return res.status(400).json({ error: "Le champ 'status' est obligatoire." });
 
-      const updated = await updateOrderStatus(merchantId, orderId, status);
-      if (!updated) return res.status(404).json({ error: "Commande introuvable" });
+    const updated = await updateOrderStatus(merchantId, orderId, status);
+    if (!updated) return res.status(404).json({ error: "Commande introuvable" });
 
-      return res.json(updated);
-    } catch (e) {
-      console.error("Erreur PUT order status", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
+    return res.json(updated);
+  } catch (e) {
+    console.error("Erreur PUT order status", e);
+    return res.status(500).json({ error: "Erreur serveur" });
   }
-);
+});
 
 // ================================
 // Admin Auth + Admin API
@@ -871,7 +1019,6 @@ app.get("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
   }
 });
 
-// ⚠️ Correspond à AdminApp.jsx: PUT /api/admin/merchants/${merchantId}/suspend
 app.put("/api/admin/merchants/:merchantId/suspend", adminAuthMiddleware, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
@@ -887,7 +1034,6 @@ app.put("/api/admin/merchants/:merchantId/suspend", adminAuthMiddleware, async (
   }
 });
 
-// Paiement + prolongation
 app.post("/api/admin/merchants/:merchantId/payments", adminAuthMiddleware, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
@@ -914,7 +1060,6 @@ app.get("/api/admin/merchants/:merchantId/payments", adminAuthMiddleware, async 
   }
 });
 
-// Admin: créer merchant avec waha_session
 app.post("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
   try {
     const { name, email, password, whatsapp_number, waha_session } = req.body || {};
@@ -946,7 +1091,6 @@ app.post("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
   }
 });
 
-// Admin: lier merchant à WAHA (optionnel)
 app.put("/api/admin/merchants/:merchantId/waha", adminAuthMiddleware, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
