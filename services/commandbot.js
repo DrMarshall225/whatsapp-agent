@@ -229,4 +229,3 @@ export async function callCommandBot(agentInput) {
   // fallback (ne devrait pas arriver)
   return { message: "Désolé, erreur inconnue.", actions: [] };
 }
-s
