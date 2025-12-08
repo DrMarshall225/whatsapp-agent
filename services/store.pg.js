@@ -221,12 +221,11 @@ export async function setConversationState(merchantId, customerId, state) {
   const res = await query(
     `
     INSERT INTO conversation_states (merchant_id, customer_id, state)
-    VALUES ($1,$2,$3::jsonb)
+    VALUES ($1, $2, $3::jsonb)
     ON CONFLICT (merchant_id, customer_id)
     DO UPDATE SET state =
       CASE
-        WHEN jsonb_typeof(EXCLUDED.state) = 'object'
-         AND jsonb_object_length(EXCLUDED.state) = 0
+        WHEN EXCLUDED.state = '{}'::jsonb
           THEN '{}'::jsonb
         ELSE COALESCE(conversation_states.state, '{}'::jsonb) || EXCLUDED.state
       END
@@ -237,6 +236,7 @@ export async function setConversationState(merchantId, customerId, state) {
 
   return res.rows[0]?.state || {};
 }
+
 
 /* =========================
    Cart
