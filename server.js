@@ -672,11 +672,7 @@ async function applyAction(action, ctx) {
       return;
     }
 
-   // ================================
-// PARTIE 2/2 - Suite de applyAction() et routes
-// ================================
-
-    case "CONFIRM_ORDER": {
+       case "CONFIRM_ORDER": {
       const st = await getConversationState(merchant.id, customer.id);
 
       if (!st?.recipient_mode) {
@@ -800,7 +796,7 @@ async function applyAction(action, ctx) {
       return;
   }
 }
-}
+
 
 
 // ================================
@@ -1273,8 +1269,7 @@ app.put("/api/admin/merchants/:merchantId/waha", adminAuthMiddleware, async (req
     }
     return res.status(500).json({ error: "Erreur serveur" });
   }
-}
-);
+});
 
 // ================================
 // Start server
