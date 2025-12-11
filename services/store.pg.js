@@ -378,7 +378,6 @@ export async function clearCart(merchantId, customerId) {
 // dans store.pg.js par cette version
 // ============================================
 
-import { query, withTransaction } from "../db.js";
 
 /**
  * ✅ VERSION FINALE avec withTransaction (recommandé)
