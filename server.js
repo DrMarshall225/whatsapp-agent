@@ -1,11 +1,11 @@
-// server.js
-import "dotenv/config";
 import cors from "cors";
 import express from "express";
+import bodyParser from "body-parser";
 import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
+import bcrypt from "bcrypt";
 
 import {
+  // WhatsApp / bot core
   findMerchantByWahaSession,
   findMerchantByWhatsappNumber,
   findOrCreateCustomer,
@@ -17,26 +17,34 @@ import {
   removeFromCart,
   clearCart,
   createOrderFromCart,
-  createProductForMerchant,
-  updateProductForMerchant,
-  deleteProductForMerchant,
   updateCustomerField,
-  getOrdersForMerchant,
-  getOrderWithItems,
-  updateOrderStatus,
-  findMerchantByEmail,
-  createMerchant,
-  createMerchantWithWaha,
-  updateMerchantWahaConfig,
   updateCustomerProfile,
   getLastOrderWithItemsForCustomer,
   cancelLastOrderForCustomer,
   loadLastOrderToCart,
+
+  // Backoffice merchant
+  createProductForMerchant,
+  updateProductForMerchant,
+  deleteProductForMerchant,
+  getOrdersForMerchant,
+  getOrderWithItems,
+  updateOrderStatus,
+
+  // Auth merchant
+  findMerchantByEmail,
+  createMerchant,
+
+  // Admin
+  createMerchantWithWaha,
+  updateMerchantWahaConfig,
   adminListMerchants,
   adminSetMerchantSuspended,
   adminGetDashboard,
   adminAddSubscriptionPayment,
   adminListSubscriptionPayments,
+
+  // Subscription gate
   getMerchantAccessFlags,
 } from "./services/store.pg.js";
 
@@ -45,23 +53,121 @@ import { sendWhatsappMessage } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 
 // ================================
-// App config
+// Config
 // ================================
 const app = express();
-
-app.use(
-  cors({
-    origin: true, // OK pour dev / multi-origins
-    credentials: true,
-  })
-);
-
-app.use(express.json({ limit: "5mb" }));
+app.use(cors());
+app.use(bodyParser.json({ limit: "5mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
 
+// Admin credentials (prod conseillé)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // ex: admin@dido.com
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt hash
+
 // ================================
-// Helpers (phone / WAHA)
+// Helpers (Validation & Anti-ACK)
+// ================================
+const ACK_WORDS = new Set([
+  "ok",
+  "okay",
+  "oui",
+  "yes",
+  "y",
+  "d'accord",
+  "daccord",
+  "dac",
+  "ça marche",
+  "ca marche",
+  "c'est bon",
+  "cest bon",
+  "vas-y",
+  "vas y",
+  "go",
+  "bien",
+  "👍",
+  "👌",
+]);
+
+function normText(s) {
+  return (s || "").toString().trim().toLowerCase();
+}
+
+function isAckValue(val) {
+  const t = normText(val);
+  if (!t) return true;
+  return ACK_WORDS.has(t);
+}
+
+function lettersCount(str) {
+  return ((str || "").match(/[A-Za-zÀ-ÿ]/g) || []).length;
+}
+
+function looksLikeName(val) {
+  if (isAckValue(val)) return false;
+  const v = (val || "").toString().trim();
+  return v.length >= 2 && lettersCount(v) >= 2;
+}
+
+// ✅ CORRECTION #1: Harmonisé avec workflow (>= 5 au lieu de >= 6)
+function looksLikeAddress(val) {
+  if (isAckValue(val)) return false;
+  const v = (val || "").toString().trim();
+  return v.length >= 5 && lettersCount(v) >= 1; // ✅ >= 5 pour accepter "Angré"
+}
+
+function looksLikePhone(val) {
+  if (isAckValue(val)) return false;
+  const digits = (val || "").toString().replace(/\D/g, "");
+  return digits.length >= 8;
+}
+
+function looksLikeDelivery(val) {
+  if (isAckValue(val)) return false;
+  const t = normText(val);
+  // Indices simples (tu peux enrichir au besoin)
+  return (
+    /\d{4}-\d{2}-\d{2}/.test(t) ||
+    /\d{2}\/\d{2}\/\d{4}/.test(t) ||
+    /\b(demain|aujourd|auj|ce soir|cet|dans)\b/.test(t) ||
+    /\b(\d{1,2}h|\d{1,2}:\d{2})\b/.test(t)
+  );
+}
+
+// ✅ CORRECTION #2: Ajout validation payment_method
+function looksLikePaymentMethod(val) {
+  if (isAckValue(val)) return false;
+  const t = normText(val);
+  return /\b(cash|espece|wave|orange|mtn|moov|mobile money|carte|card)\b/.test(t);
+}
+
+function validateField(field, value) {
+  switch (field) {
+    case "name":
+    case "self_name":
+    case "recipient_name":
+      return looksLikeName(value);
+    case "address":
+    case "recipient_address":
+      return looksLikeAddress(value);
+    case "phone":
+    case "recipient_phone":
+      return looksLikePhone(value);
+    case "delivery_requested_raw":
+      return looksLikeDelivery(value);
+    case "payment_method":
+      return looksLikePaymentMethod(value); // ✅ NOUVEAU
+    case "recipient_mode":
+      // traité séparément (1/2/moi/autre)
+      return !isAckValue(value) && normText(value).length > 0;
+    default:
+      // Refuser ACK par défaut
+      return !isAckValue(value);
+  }
+}
+
+// ================================
+// Helpers (Phones / WAHA)
 // ================================
 function normalizePhone(phone) {
   if (!phone) return null;
@@ -85,22 +191,15 @@ function normalizeWahaChatId(raw) {
   const s = String(raw);
 
   if (s.endsWith("@s.whatsapp.net")) return s.replace("@s.whatsapp.net", "@c.us");
-  if (s.endsWith("@lid")) return s; // WAHA peut donner @lid
+  if (s.endsWith("@lid")) return s; // WAHA peut fournir @lid
   if (s.includes("@")) return s;
 
   const digits = s.replace(/[^\d]/g, "");
   return digits ? `${digits}@c.us` : null;
 }
 
-function isStatusBroadcast(id) {
-  return (
-    !!id &&
-    (String(id).includes("status@broadcast") || String(id).includes("false_status@broadcast"))
-  );
-}
-
 function mapWhatsappPayload(body) {
-  // Postman: { from, to, text }
+  // Postman : { from, to, text }
   return {
     from: body?.from,
     to: body?.to,
@@ -108,130 +207,15 @@ function mapWhatsappPayload(body) {
   };
 }
 
-function pickTextFromWaha(root) {
-  const p = root?.payload || root;
-  return (
-    p?.text ||
-    p?.body ||
-    p?.message?.text ||
-    p?.payload?.text ||
-    p?.payload?.body ||
-    root?.payload?.text ||
-    root?.payload?.body ||
-    null
-  );
-}
-
-// ================================
-// Middlewares
-// ================================
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  const [type, token] = authHeader.split(" ");
-
-  if (type !== "Bearer" || !token) {
-    return res.status(401).json({ error: "Token manquant ou invalide" });
-  }
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.merchantId = payload.merchantId;
-    return next();
-  } catch (e) {
-    return res.status(401).json({ error: "Token invalide" });
-  }
-}
-
-function requireSameMerchant(req, res, next) {
-  const merchantId = Number(req.params.merchantId);
-  if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
-  if (req.merchantId !== merchantId)
-    return res.status(403).json({ error: "Accès interdit (mauvais marchand)" });
-  return next();
-}
-
-function adminAuthMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  const [type, token] = authHeader.split(" ");
-  if (type !== "Bearer" || !token) return res.status(401).json({ error: "Token admin manquant" });
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload.role !== "admin") return res.status(403).json({ error: "Accès refusé" });
-    req.admin = payload;
-    return next();
-  } catch {
-    return res.status(401).json({ error: "Token admin invalide" });
-  }
-}
-
-async function subscriptionGate(req, res, next) {
-  const merchantId = Number(req.params.merchantId);
-  const m = await getMerchantAccessFlags(merchantId);
-  if (!m) return res.status(404).json({ error: "Marchand introuvable" });
-
-  if (m.is_suspended) return res.status(403).json({ error: "Compte suspendu. Contactez l’admin." });
-
-  if (m.subscription_expires_at && new Date(m.subscription_expires_at).getTime() < Date.now()) {
-    return res.status(402).json({ error: "Abonnement expiré. Veuillez renouveler (15 000 FCFA / mois)." });
-  }
-  return next();
-}
-
-// ================================
-// Mini NLP helpers (pour éviter les boucles)
-// ================================
-function looksLikeAck(msg) {
-  const s = String(msg || "").trim().toLowerCase();
-  return ["ok", "okay", "d’accord", "dac", "👍", "👌", "oui"].includes(s);
-}
-function looksLikeSelf(msg) {
-  const s = String(msg || "").trim().toLowerCase();
-  return ["1", "moi", "pour moi", "pour moi-même", "pour moi meme", "c'est moi", "meme"].some((k) =>
-    s.includes(k)
-  );
-}
-function looksLikeThird(msg) {
-  const s = String(msg || "").trim().toLowerCase();
-  return ["2", "autre", "tiers", "tierce", "quelqu'un", "quelquun", "pour lui", "pour elle"].some((k) =>
-    s.includes(k)
-  );
-}
 function normalizeE164(input) {
   if (!input) return null;
   const digits = String(input).replace(/[^\d]/g, "");
   return digits ? `+${digits}` : null;
 }
 
-// Convertit "aujourd’hui 16h", "demain 14h", "après demain 15h" => "DD/MM/YYYY HH:mm"
-function normalizeRelativeDelivery(text, now = new Date()) {
-  if (!text) return null;
-  const t = String(text).toLowerCase();
-
-  let addDays = null;
-  if (/(apres|après)\s*-?\s*demain/.test(t)) addDays = 2;
-  else if (t.includes("aujourd")) addDays = 0;
-  else if (t.includes("demain")) addDays = 1;
-
-  const m = t.match(/\b(\d{1,2})(?:\s*[h:]\s*(\d{2}))?\b/);
-  if (addDays === null || !m) return null;
-
-  const hh = Number(m[1]);
-  const mm = m[2] ? Number(m[2]) : 0;
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-
-  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-  d.setDate(d.getDate() + addDays);
-
-  const dd = String(d.getDate()).padStart(2, "0");
-  const MM = String(d.getMonth() + 1).padStart(2, "0");
-  const yyyy = d.getFullYear();
-  const HH = String(hh).padStart(2, "0");
-  const MIN = String(mm).padStart(2, "0");
-
-  return `${dd}/${MM}/${yyyy} ${HH}:${MIN}`;
-}
-
+// Parse très simple:
+// - "YYYY-MM-DD" ou "YYYY-MM-DD HH:mm"
+// - "DD/MM/YYYY" ou "DD/MM/YYYY HH:mm"
 function parseDeliveryRequestedAt(rawText) {
   if (!rawText) return null;
   const s = String(rawText).trim();
@@ -266,510 +250,608 @@ function isPastDate(d) {
   return d.getTime() < Date.now();
 }
 
-// ================================
-// Healthcheck
-// ================================
-app.get("/", (req, res) => res.status(200).send("whatsapp-agent OK ✅"));
+function isReactivationMessage(text) {
+  const t = normText(text);
+  return ["start", "reprends", "recommence", "continue"].some((k) => t === k || t.includes(k));
+}
 
 // ================================
-// Core actions from n8n
+// Middlewares
 // ================================
-async function applyAction(action, context) {
-  const { merchant, customer } = context;
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const [type, token] = authHeader.split(" ");
 
-  switch (action.type) {
-    case "ADD_TO_CART":
-      await addToCart(merchant.id, customer.id, Number(action.product_id), action.quantity || 1);
-      break;
+  if (type !== "Bearer" || !token) {
+    return res.status(401).json({ error: "Token manquant ou invalide" });
+  }
 
-    case "REMOVE_FROM_CART":
-      await removeFromCart(merchant.id, customer.id, Number(action.product_id));
-      break;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.merchantId = payload.merchantId;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Token invalide" });
+  }
+}
 
-    case "CLEAR_CART":
-      await clearCart(merchant.id, customer.id);
-      break;
+function requireSameMerchant(req, res, next) {
+  const merchantId = Number(req.params.merchantId);
+  if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+  if (req.merchantId !== merchantId) return res.status(403).json({ error: "Accès interdit (mauvais marchand)" });
+  next();
+}
 
-    case "SET_STATE": {
-      const current = (await getConversationState(merchant.id, customer.id)) || {};
-      const merged = { ...current, ...(action.state || {}) };
-      await setConversationState(merchant.id, customer.id, merged);
-      break;
+async function subscriptionGate(req, res, next) {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
+
+    const m = await getMerchantAccessFlags(merchantId);
+    if (!m) return res.status(404).json({ error: "Marchand introuvable" });
+
+    if (m.is_suspended) return res.status(403).json({ error: "Compte suspendu. Contactez l'admin." });
+
+    if (m.subscription_expires_at && new Date(m.subscription_expires_at).getTime() < Date.now()) {
+      return res.status(402).json({ error: "Abonnement expiré. Veuillez renouveler (15 000 FCFA / mois)." });
     }
 
-    case "ASK_INFO": {
-      const current = (await getConversationState(merchant.id, customer.id)) || {};
-      const merged = { ...current, step: "ASKING_INFO", waiting_field: action.field };
-      await setConversationState(merchant.id, customer.id, merged);
-      break;
-    }
+    req.merchantAccess = m;
+    next();
+  } catch (e) {
+    console.error("subscriptionGate error", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+}
 
-    case "UPDATE_CUSTOMER":
-      await updateCustomerField(merchant.id, customer.id, action.field, action.value);
-      break;
+function adminAuthMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const [type, token] = authHeader.split(" ");
+  if (type !== "Bearer" || !token) return res.status(401).json({ error: "Token admin manquant" });
 
-    case "SHOW_LAST_ORDER": {
-      const last = await getLastOrderWithItemsForCustomer(merchant.id, customer.id);
-      context.overrideMessage = last
-        ? `Votre dernière commande (#${last.order.id}) est ${last.order.status}. Total: ${last.order.total_amount} ${last.order.currency}.`
-        : "Vous n’avez pas encore de commande.";
-      break;
-    }
-
-    case "CANCEL_LAST_ORDER": {
-      const result = await cancelLastOrderForCustomer(merchant.id, customer.id);
-      if (!result) context.overrideMessage = "Vous n’avez pas encore de commande à annuler.";
-      else if (result.blocked) context.overrideMessage = `Impossible d’annuler : ${result.reason}`;
-      else context.overrideMessage = `✅ D’accord. J’ai annulé votre commande (#${result.order.id}).`;
-      break;
-    }
-
-    case "MODIFY_LAST_ORDER": {
-      const result = await loadLastOrderToCart(merchant.id, customer.id);
-      if (!result) context.overrideMessage = "Vous n’avez pas encore de commande à modifier.";
-      else if (result.blocked) context.overrideMessage = `Impossible de modifier : ${result.reason}`;
-      else
-        context.overrideMessage =
-          "✅ Ok. J’ai remis votre dernière commande dans le panier. Ajoutez/retirez des articles puis écrivez *Je confirme*.";
-      break;
-    }
-
-    case "CONFIRM_ORDER": {
-      // Safety gate (ne valide pas si infos manquantes)
-      const st = (await getConversationState(merchant.id, customer.id)) || {};
-      const cart = await getCart(merchant.id, customer.id);
-
-      const hasItems =
-        (Array.isArray(cart?.items) && cart.items.length > 0) ||
-        (typeof cart?.total_items === "number" && cart.total_items > 0);
-
-      if (!hasItems) {
-        context.overrideMessage = "Votre panier est vide. Dites-moi le produit et la quantité 🙂";
-        break;
-      }
-
-      if (!st.recipient_mode) {
-        await setConversationState(merchant.id, customer.id, {
-          ...st,
-          step: "ASKING_INFO",
-          waiting_field: "recipient_mode",
-          last_question: "RECIPIENT_CHOICE",
-        });
-        context.overrideMessage = "C’est pour vous-même (1) ou pour une autre personne (2) ?";
-        break;
-      }
-
-      // payment + delivery requis pour confirmer (selon ton workflow)
-      if (!customer.payment_method) {
-        await setConversationState(merchant.id, customer.id, {
-          ...st,
-          step: "ASKING_INFO",
-          waiting_field: "payment_method",
-          last_question: "ASK_PAYMENT",
-        });
-        context.overrideMessage =
-          "Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)";
-        break;
-      }
-
-      if (!st.delivery_requested_raw) {
-        await setConversationState(merchant.id, customer.id, {
-          ...st,
-          step: "ASKING_INFO",
-          waiting_field: "delivery_requested_raw",
-          last_question: "ASK_DELIVERY_DATETIME",
-        });
-        context.overrideMessage =
-          "Il me manque la date et l’heure de livraison. Pour quand souhaitez-vous la livraison ? (ex : demain 14h)";
-        break;
-      }
-
-      const deliveryAt = parseDeliveryRequestedAt(st.delivery_requested_raw);
-      if (!deliveryAt || isPastDate(deliveryAt)) {
-        await setConversationState(merchant.id, customer.id, {
-          ...st,
-          step: "ASKING_INFO",
-          waiting_field: "delivery_requested_raw",
-          last_question: "ASK_DELIVERY_DATETIME",
-          delivery_requested_raw: null,
-        });
-        context.overrideMessage =
-          "Date/heure invalide. Envoyez par ex : 10/12/2025 16:00 (ou demain 14h).";
-        break;
-      }
-
-      if (st.recipient_mode === "self") {
-        if (!customer.name) {
-          await setConversationState(merchant.id, customer.id, {
-            ...st,
-            step: "ASKING_INFO",
-            waiting_field: "name",
-            last_question: "ASK_NAME",
-          });
-          context.overrideMessage = "Quel est votre nom et prénom ?";
-          break;
-        }
-        if (!customer.address) {
-          await setConversationState(merchant.id, customer.id, {
-            ...st,
-            step: "ASKING_INFO",
-            waiting_field: "address",
-            last_question: "ASK_ADDRESS",
-          });
-          context.overrideMessage =
-            "Quelle est votre adresse de livraison ? (ex : Cocody Angré 10e tranche, Abidjan)";
-          break;
-        }
-
-        await createOrderFromCart(merchant.id, customer.id, {
-          id: customer.id,
-          name: customer.name,
-          phone: customer.phone,
-          address: customer.address,
-          payment_method: customer.payment_method,
-          delivery_requested_raw: st.delivery_requested_raw,
-        });
-
-        break;
-      }
-
-      if (st.recipient_mode === "third_party") {
-        if (!st.recipient_name) {
-          await setConversationState(merchant.id, customer.id, {
-            ...st,
-            step: "ASKING_INFO",
-            waiting_field: "recipient_name",
-            last_question: "ASK_RECIPIENT_NAME",
-          });
-          context.overrideMessage = "Donne-moi le nom et prénom du destinataire.";
-          break;
-        }
-        if (!st.recipient_phone) {
-          await setConversationState(merchant.id, customer.id, {
-            ...st,
-            step: "ASKING_INFO",
-            waiting_field: "recipient_phone",
-            last_question: "ASK_RECIPIENT_PHONE",
-          });
-          context.overrideMessage = "Donne-moi son numéro WhatsApp (format 225XXXXXXXXXX).";
-          break;
-        }
-        if (!st.recipient_address) {
-          await setConversationState(merchant.id, customer.id, {
-            ...st,
-            step: "ASKING_INFO",
-            waiting_field: "recipient_address",
-            last_question: "ASK_RECIPIENT_ADDRESS",
-          });
-          context.overrideMessage =
-            "Quelle est l’adresse de livraison du destinataire ? (ex : Angré 8e tranche, Abidjan)";
-          break;
-        }
-
-        const recipientPhone = normalizeE164(st.recipient_phone);
-        const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
-
-        await updateCustomerProfile(merchant.id, recipient.id, {
-          name: st.recipient_name,
-          address: st.recipient_address,
-        });
-
-        await createOrderFromCart(merchant.id, customer.id, {
-          id: recipient.id,
-          name: st.recipient_name,
-          phone: recipientPhone,
-          address: st.recipient_address,
-          payment_method: customer.payment_method,
-          delivery_requested_raw: st.delivery_requested_raw,
-        });
-
-        break;
-      }
-
-      break;
-    }
-
-    default:
-      console.warn("⚠️ Action inconnue", action);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.role !== "admin") return res.status(403).json({ error: "Accès refusé" });
+    req.admin = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token admin invalide" });
   }
 }
 
 // ================================
-// Structured reply handler (anti-boucle)
+// Structured replies (sans IA) - CORRIGÉ + LOOP GUARD
 // ================================
+function looksLikeRecipientSelf(msg) {
+  const s = normText(msg);
+  return (
+    s === "1" ||
+    s.includes("moi") ||
+    s.includes("pour moi") ||
+    s.includes("c'est pour moi") ||
+    s.includes("cest pour moi") ||
+    s.includes("moi-même") ||
+    s.includes("moi meme")
+  );
+}
+
+function looksLikeRecipientThird(msg) {
+  const s = normText(msg);
+  return (
+    s === "2" ||
+    s.includes("autre") ||
+    s.includes("tier") ||
+    s.includes("tierce") ||
+    s.includes("quelqu") ||
+    s.includes("pour lui") ||
+    s.includes("pour elle")
+  );
+}
+
 async function tryHandleStructuredReply({ merchant, customer, text, conversationState }) {
   const waiting = conversationState?.waiting_field;
   if (!waiting) return { handled: false };
 
   const clean = String(text || "").trim();
-  if (!clean) return { handled: true, message: "Je n’ai pas bien reçu. Peux-tu répéter ?" };
+  if (!clean) return { handled: true, message: "Je n'ai pas bien reçu. Peux-tu répéter ?" };
 
-  // recipient_mode
-  if (waiting === "recipient_mode") {
-    if (!looksLikeSelf(clean) && !looksLikeThird(clean)) {
-      return { handled: true, message: "Réponds : 1 = pour toi-même, 2 = pour une autre personne." };
-    }
+  // ✅ CORRECTION #3: LOOP GUARD (limite 3 tentatives)
+  const loopGuard = conversationState?.loop_guard || {};
+  const currentKey = `${waiting}_question`;
+  const count = (loopGuard.key === currentKey ? loopGuard.count : 0) + 1;
 
-    const next = { ...conversationState, recipient_mode: looksLikeSelf(clean) ? "self" : "third_party" };
-
-    if (next.recipient_mode === "self") {
-      if (!customer.name) {
-        await setConversationState(merchant.id, customer.id, {
-          ...next,
-          step: "ASKING_INFO",
-          waiting_field: "name",
-          last_question: "ASK_NAME",
-        });
-        return { handled: true, message: "Merci 🙂 Quel est votre nom et prénom ?" };
-      }
-      if (!customer.address) {
-        await setConversationState(merchant.id, customer.id, {
-          ...next,
-          step: "ASKING_INFO",
-          waiting_field: "address",
-          last_question: "ASK_ADDRESS",
-        });
-        return { handled: true, message: "Quelle est votre adresse de livraison ? (ex : Angré 10e tranche, Abidjan)" };
-      }
-      if (!customer.payment_method) {
-        await setConversationState(merchant.id, customer.id, {
-          ...next,
-          step: "ASKING_INFO",
-          waiting_field: "payment_method",
-          last_question: "ASK_PAYMENT",
-        });
-        return { handled: true, message: "Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)" };
-      }
-      await setConversationState(merchant.id, customer.id, {
-        ...next,
-        step: "ASKING_INFO",
-        waiting_field: "delivery_requested_raw",
-        last_question: "ASK_DELIVERY_DATETIME",
-      });
-      return { handled: true, message: "Pour quand souhaitez-vous la livraison ? (ex : demain 14h, 10/12/2025 16:00)" };
-    }
-
-    // third_party flow
+  if (count > 3) {
     await setConversationState(merchant.id, customer.id, {
-      ...next,
-      step: "ASKING_INFO",
-      waiting_field: "recipient_name",
-      last_question: "ASK_RECIPIENT_NAME",
+      ...conversationState,
+      step: "NEEDS_HUMAN",
+      waiting_field: null,
+      loop_guard: null,
     });
-    return { handled: true, message: "Très bien. Donne-moi le nom et prénom du destinataire." };
+    return {
+      handled: true,
+      message: "Je n'arrive pas à comprendre cette information. Un conseiller va te recontacter 🙂",
+    };
   }
 
-  // name
-  if (waiting === "name") {
-    if (looksLikeAck(clean)) {
-      return { handled: true, message: "Quel est votre nom et prénom ? (ex : Diabaté Falikou)" };
-    }
-    await updateCustomerField(merchant.id, customer.id, "name", clean);
+  // Si ACK alors on redemande la vraie valeur (important)
+  const fieldsRequiringValue = [
+    "name",
+    "self_name",
+    "recipient_name",
+    "recipient_address",
+    "recipient_phone",
+    "delivery_requested_raw",
+    "payment_method", // ✅ AJOUTÉ
+  ];
 
-    const st = { ...(conversationState || {}) };
-    if (!customer.address) {
-      await setConversationState(merchant.id, customer.id, {
-        ...st,
-        step: "ASKING_INFO",
-        waiting_field: "address",
-        last_question: "ASK_ADDRESS",
-      });
-      return { handled: true, message: "Merci 🙂 Quelle est votre adresse de livraison ? (ex : Angré 10e tranche, Abidjan)" };
-    }
-    if (!customer.payment_method) {
-      await setConversationState(merchant.id, customer.id, {
-        ...st,
-        step: "ASKING_INFO",
-        waiting_field: "payment_method",
-        last_question: "ASK_PAYMENT",
-      });
-      return { handled: true, message: "Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)" };
-    }
+  if (isAckValue(clean) && fieldsRequiringValue.includes(waiting)) {
+    // ✅ Incrémenter loop_guard
     await setConversationState(merchant.id, customer.id, {
-      ...st,
-      step: "ASKING_INFO",
-      waiting_field: "delivery_requested_raw",
-      last_question: "ASK_DELIVERY_DATETIME",
+      ...conversationState,
+      loop_guard: { key: currentKey, count },
     });
-    return { handled: true, message: "Pour quand souhaitez-vous la livraison ? (ex : demain 14h, 10/12/2025 16:00)" };
+
+    const mapMsg = {
+      name: "Quel est votre **nom complet** ? (ex : "KONE Aïcha")",
+      self_name: "Quel est votre **nom complet** ? (ex : "KONE Aïcha")",
+      recipient_name: "Quel est le **nom complet** du destinataire ? (ex : "KONE Aïcha")",
+      recipient_phone: "Quel est le **numéro WhatsApp** du destinataire ? (ex : 225XXXXXXXXXX)",
+      recipient_address: "Quelle est l'**adresse complète** du destinataire ? (ex : "Cocody Angré …")",
+      delivery_requested_raw: "Donnez la **date/heure de livraison** (ex : 2025-12-10 14:30).",
+      payment_method: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)", // ✅ NOUVEAU
+    };
+    return { handled: true, message: mapMsg[waiting] || "Je vous écoute 🙂 Peux-tu préciser ?" };
   }
 
-  // address
-  if (waiting === "address") {
-    if (looksLikeAck(clean) || clean.length < 6) {
-      return { handled: true, message: "Adresse trop courte. Exemple : Cocody Angré 10e tranche, Abidjan." };
-    }
-    await updateCustomerField(merchant.id, customer.id, "address", clean);
-
-    const st = { ...(conversationState || {}) };
-    if (!customer.payment_method) {
-      await setConversationState(merchant.id, customer.id, {
-        ...st,
-        step: "ASKING_INFO",
-        waiting_field: "payment_method",
-        last_question: "ASK_PAYMENT",
-      });
-      return { handled: true, message: "Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)" };
-    }
-
-    await setConversationState(merchant.id, customer.id, {
-      ...st,
-      step: "ASKING_INFO",
-      waiting_field: "delivery_requested_raw",
-      last_question: "ASK_DELIVERY_DATETIME",
-    });
-    return { handled: true, message: "Pour quand souhaitez-vous la livraison ? (ex : demain 14h, 10/12/2025 16:00)" };
-  }
-
-  // payment_method
+  // ✅ NOUVEAU: Gestion payment_method
   if (waiting === "payment_method") {
-    if (looksLikeAck(clean)) {
-      return { handled: true, message: "Quel mode de paiement ? (cash, wave, orange, mtn, carte…)" };
+    if (!validateField("payment_method", clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return {
+        handled: true,
+        message: "Mode de paiement non reconnu. Choisis parmi : *cash*, *Wave*, *Orange Money*, *MTN*, *carte*.",
+      };
     }
     await updateCustomerField(merchant.id, customer.id, "payment_method", clean);
-
-    const st = { ...(conversationState || {}) };
     await setConversationState(merchant.id, customer.id, {
-      ...st,
-      step: "ASKING_INFO",
-      waiting_field: "delivery_requested_raw",
-      last_question: "ASK_DELIVERY_DATETIME",
+      ...conversationState,
+      waiting_field: null,
+      loop_guard: null, // ✅ Reset après succès
     });
-    return { handled: true, message: "Pour quand souhaitez-vous la livraison ? (ex : demain 14h, 10/12/2025 16:00)" };
+    return {
+      handled: true,
+      message: "Merci ✅. Maintenant écris *Je confirme* pour valider la commande.",
+    };
   }
 
-  // recipient_name
+  // Date/heure de livraison (HARMONISÉE)
+  if (waiting === "delivery_requested_raw") {
+    if (!validateField("delivery_requested_raw", clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "Format non valide. Exemple : *2025-12-10 14:30* ou *10/12/2025 14:30*." };
+    }
+    await setConversationState(merchant.id, customer.id, {
+      ...conversationState,
+      delivery_requested_raw: clean,
+      waiting_field: null,
+      loop_guard: null, // ✅ Reset après succès
+    });
+    return {
+      handled: true,
+      message: "Merci ✅. Maintenant écris *Je confirme* pour valider la commande.",
+    };
+  }
+
+  // Nom (self)
+  if (waiting === "name" || waiting === "self_name") {
+    if (!validateField("name", clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "J'ai besoin de votre **nom complet** (ex : "KONE Aïcha")." };
+    }
+    await updateCustomerField(merchant.id, customer.id, "name", clean);
+    await setConversationState(merchant.id, customer.id, {
+      ...conversationState,
+      waiting_field: null,
+      loop_guard: null, // ✅ Reset après succès
+    });
+    return { handled: true, message: `Merci ${clean} ✅. Écris *Je confirme* pour valider.` };
+  }
+
+  // Choix destinataire : 1/2/moi/autre
+  if (waiting === "recipient_mode") {
+    if (isAckValue(clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "Réponds : *1* = pour toi-même, *2* = pour une autre personne." };
+    }
+
+    if (looksLikeRecipientSelf(clean)) {
+      const nextState = { ...conversationState, recipient_mode: "self", waiting_field: null, step: null, loop_guard: null };
+      await setConversationState(merchant.id, customer.id, nextState);
+
+      if (!customer.name) {
+        await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "name" });
+        return { handled: true, message: "D'accord 🙂 Quel est votre nom (et prénom) ?" };
+      }
+
+      // ✅ CORRECTION #4: Vérifier payment_method avant delivery
+      if (!customer.payment_method) {
+        await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "payment_method" });
+        return { handled: true, message: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)" };
+      }
+
+      // ensuite livraison
+      await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "delivery_requested_raw" });
+      return { handled: true, message: "Parfait ✅. Donnez-moi la *date/heure de livraison* (ex: 2025-12-10 14:30)." };
+    }
+
+    if (looksLikeRecipientThird(clean)) {
+      const nextState = { ...conversationState, recipient_mode: "third_party", waiting_field: "recipient_name", step: "ASKING_INFO", loop_guard: null };
+      await setConversationState(merchant.id, customer.id, nextState);
+      return { handled: true, message: "Très bien. Donne-moi le *nom et prénom* du destinataire." };
+    }
+
+    await setConversationState(merchant.id, customer.id, {
+      ...conversationState,
+      loop_guard: { key: currentKey, count },
+    });
+    return { handled: true, message: "Réponds : *1* = pour toi-même, *2* = pour une autre personne." };
+  }
+
+  // Tiers : nom
   if (waiting === "recipient_name") {
-    if (looksLikeAck(clean) || clean.length < 2) {
-      return { handled: true, message: "Donne-moi le nom et prénom du destinataire (ex : Diaby Aminata)." };
+    if (!validateField("recipient_name", clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "J'ai besoin du **nom complet** du destinataire (ex : "KONE Aïcha")." };
     }
-    const next = { ...conversationState, recipient_name: clean };
-    await setConversationState(merchant.id, customer.id, {
-      ...next,
-      step: "ASKING_INFO",
-      waiting_field: "recipient_phone",
-      last_question: "ASK_RECIPIENT_PHONE",
-    });
-    return { handled: true, message: "Super. Donne-moi son numéro WhatsApp (format 225XXXXXXXXXX)." };
+    const nextState = { ...conversationState, recipient_name: clean, waiting_field: "recipient_phone", step: "ASKING_INFO", loop_guard: null };
+    await setConversationState(merchant.id, customer.id, nextState);
+    return { handled: true, message: "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX)." };
   }
 
-  // recipient_phone
+  // Tiers : téléphone
   if (waiting === "recipient_phone") {
-    const phone = normalizeE164(clean);
-    if (!phone || phone.replace(/[^\d]/g, "").length < 8) {
-      return { handled: true, message: "Numéro invalide. Exemple : 2250700000000" };
+    if (!validateField("recipient_phone", clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "Numéro invalide. Envoie le numéro au format: *225XXXXXXXXXX*." };
     }
-    const next = { ...conversationState, recipient_phone: phone };
-    await setConversationState(merchant.id, customer.id, {
-      ...next,
-      step: "ASKING_INFO",
-      waiting_field: "recipient_address",
-      last_question: "ASK_RECIPIENT_ADDRESS",
-    });
-    return { handled: true, message: "Merci. Et l’adresse de livraison du destinataire ? (ex : Angré 8e tranche, Abidjan)" };
+    const phone = normalizePhone(clean);
+    if (!phone) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "Numéro invalide. Envoie le numéro au format: *225XXXXXXXXXX*." };
+    }
+
+    const nextState = { ...conversationState, recipient_phone: phone, waiting_field: "recipient_address", step: "ASKING_INFO", loop_guard: null };
+    await setConversationState(merchant.id, customer.id, nextState);
+    return { handled: true, message: "Merci. Et l'*adresse de livraison* du destinataire ?" };
   }
 
-  // recipient_address
+  // Tiers : adresse
   if (waiting === "recipient_address") {
-    if (looksLikeAck(clean) || clean.length < 6) {
-      return { handled: true, message: "Adresse trop courte. Exemple : Angré 8e tranche, Abidjan." };
+    if (!validateField("recipient_address", clean)) {
+      await setConversationState(merchant.id, customer.id, {
+        ...conversationState,
+        loop_guard: { key: currentKey, count },
+      });
+      return { handled: true, message: "J'ai besoin d'une **adresse complète** (ex : "Cocody Angré 8e tranche …")." };
     }
-    const next = { ...conversationState, recipient_address: clean };
+
+    // ✅ CORRECTION #5: Vérifier payment_method avant de terminer
+    const nextState = { ...conversationState, recipient_address: clean, waiting_field: null, loop_guard: null };
 
     if (!customer.payment_method) {
-      await setConversationState(merchant.id, customer.id, {
-        ...next,
-        step: "ASKING_INFO",
-        waiting_field: "payment_method",
-        last_question: "ASK_PAYMENT",
-      });
-      return { handled: true, message: "Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)" };
+      await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "payment_method" });
+      return { handled: true, message: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)" };
     }
 
-    await setConversationState(merchant.id, customer.id, {
-      ...next,
-      step: "ASKING_INFO",
-      waiting_field: "delivery_requested_raw",
-      last_question: "ASK_DELIVERY_DATETIME",
-    });
-    return { handled: true, message: "Pour quand souhaitez-vous la livraison ? (ex : demain 14h, 10/12/2025 16:00)" };
-  }
-
-  // delivery_requested_raw
-  if (waiting === "delivery_requested_raw") {
-    if (looksLikeAck(clean)) {
-      return { handled: true, message: "Donnez la date/heure. Exemple : 10/12/2025 16:00 (ou demain 14h)." };
-    }
-
-    // On accepte relatif et on normalise si possible
-    const normalized = normalizeRelativeDelivery(clean) || clean;
-    const next = { ...conversationState, delivery_requested_raw: normalized };
-
-    await setConversationState(merchant.id, customer.id, {
-      ...next,
-      step: "ASKING_INFO",
-      waiting_field: "",
-      last_question: "WAITING_FINAL_CONFIRM",
-    });
-
-    return { handled: true, message: "Parfait ✅ Pour valider la commande, écrivez : Je confirme." };
+    // Sinon passer à delivery
+    await setConversationState(merchant.id, customer.id, { ...nextState, step: "ASKING_INFO", waiting_field: "delivery_requested_raw" });
+    return { handled: true, message: "Parfait ✅. Donnez-moi la *date/heure de livraison* (ex: 2025-12-10 14:30)." };
   }
 
   return { handled: false };
 }
 
 // ================================
-// Incoming message (WAHA + Postman)
+// Healthcheck
+// ================================
+app.get("/", (req, res) => {
+  res.status(200).send("whatsapp-agent OK ✅");
+});
+
+// ================================
+// Actions IA (CORRIGÉ)
+// ================================
+async function applyAction(action, ctx) {
+  const { merchant, customer } = ctx;
+
+  switch (action.type) {
+    case "ADD_TO_CART":
+      await addToCart(merchant.id, customer.id, Number(action.product_id), action.quantity || 1);
+      return;
+
+    case "REMOVE_FROM_CART":
+      await removeFromCart(merchant.id, customer.id, Number(action.product_id));
+      return;
+
+    case "CLEAR_CART":
+      await clearCart(merchant.id, customer.id);
+      return;
+
+    case "SET_STATE": {
+      const patch = action.state || {};
+      const keys = Object.keys(patch);
+
+      // ✅ si state vide => reset complet (comme dans le prompt)
+      if (keys.length === 0) {
+        await setConversationState(merchant.id, customer.id, {});
+        return;
+      }
+
+      // ✅ sinon merge pour ne pas perdre last_question/pending_add_to_cart
+      const st = await getConversationState(merchant.id, customer.id);
+      await setConversationState(merchant.id, customer.id, { ...(st || {}), ...patch });
+      return;
+    }
+
+    case "UPDATE_CUSTOMER": {
+      const val = (action.value || "").toString().trim();
+
+      // ✅ anti-bug : refuse ACK et valeurs non plausibles
+      if (!validateField(action.field, val)) {
+        // forcer la question claire
+        const st = await getConversationState(merchant.id, customer.id);
+        await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: action.field });
+
+        ctx.overrideMessage =
+          action.field === "name"
+            ? "Parfait 🙂 Quel est votre **nom complet** ? (ex : "KONE Aïcha")"
+            : action.field === "address"
+            ? "D'accord 🙂 Quelle est votre **adresse complète** ? (ex : "Cocody Angré 8e tranche …")"
+            : action.field === "payment_method"
+            ? "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)"
+            : "Je vous écoute 🙂 Pouvez-vous préciser ?";
+        return;
+      }
+
+      await updateCustomerField(merchant.id, customer.id, action.field, val);
+      return;
+    }
+
+    case "ASK_INFO": {
+      // ✅ merge state (ne pas écraser last_question/pending_add_to_cart)
+      const st = await getConversationState(merchant.id, customer.id);
+      await setConversationState(merchant.id, customer.id, {
+        ...(st || {}),
+        step: "ASKING_INFO",
+        waiting_field: action.field,
+      });
+      return;
+    }
+
+    case "SHOW_LAST_ORDER": {
+      const last = await getLastOrderWithItemsForCustomer(merchant.id, customer.id);
+      ctx.overrideMessage = last
+        ? `Votre dernière commande (#${last.order.id}) est **${last.order.status}**. Total: ${last.order.total_amount} ${last.order.currency}.`
+        : "Vous n'avez pas encore de commande.";
+      return;
+    }
+
+    case "CANCEL_LAST_ORDER": {
+      const result = await cancelLastOrderForCustomer(merchant.id, customer.id);
+      if (!result) ctx.overrideMessage = "Vous n'avez pas encore de commande à annuler.";
+      else if (result.blocked) ctx.overrideMessage = `Impossible d'annuler : ${result.reason}`;
+      else ctx.overrideMessage = `✅ D'accord. J'ai annulé votre commande (#${result.order.id}).`;
+      return;
+    }
+
+    case "MODIFY_LAST_ORDER": {
+      const result = await loadLastOrderToCart(merchant.id, customer.id);
+      if (!result) ctx.overrideMessage = "Vous n'avez pas encore de commande à modifier.";
+      else if (result.blocked) ctx.overrideMessage = `Impossible de modifier : ${result.reason}`;
+      else ctx.overrideMessage = "✅ Ok. J'ai remis votre dernière commande dans le panier. Ajoutez/retirez puis écrivez *Je confirme*.";
+      return;
+    }
+
+   // ================================
+// PARTIE 2/2 - Suite de applyAction() et routes
+// ================================
+
+    case "CONFIRM_ORDER": {
+      const st = await getConversationState(merchant.id, customer.id);
+
+      if (!st?.recipient_mode) {
+        await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
+        ctx.overrideMessage = "Parfait ✅ C'est pour vous-même (1) ou pour une autre personne (2) ?";
+        return;
+      }
+
+      // ✅ CORRECTION #6: Vérifier payment_method AVANT delivery
+      if (!customer.payment_method) {
+        await setConversationState(merchant.id, customer.id, {
+          ...(st || {}),
+          step: "ASKING_INFO",
+          waiting_field: "payment_method",
+        });
+        ctx.overrideMessage = "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)";
+        return;
+      }
+
+      const deliveryRaw = st?.delivery_requested_raw;
+      if (!deliveryRaw) {
+        // ✅ harmonisé
+        await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "delivery_requested_raw" });
+        ctx.overrideMessage = "Merci ✅ Il me manque la date et l'heure de livraison. Pour quand souhaitez-vous la livraison ?";
+        return;
+      }
+
+      const deliveryAt = parseDeliveryRequestedAt(deliveryRaw);
+      if (!deliveryAt || isPastDate(deliveryAt)) {
+        await setConversationState(merchant.id, customer.id, {
+          ...(st || {}),
+          step: "ASKING_INFO",
+          waiting_field: "delivery_requested_raw",
+          delivery_requested_raw: null,
+        });
+        ctx.overrideMessage = "La date de livraison est invalide ou passée. Donnez une date future (ex: 2025-12-10 14:30).";
+        return;
+      }
+
+      // self
+      if (st.recipient_mode === "self") {
+        if (!customer.name) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
+          ctx.overrideMessage = "D'accord 🙂 Quel est votre nom (et prénom) ?";
+          return;
+        }
+
+        await createOrderFromCart(merchant.id, customer.id, {
+          recipientCustomerId: customer.id,
+          recipientNameSnapshot: customer.name,
+          recipientPhoneSnapshot: customer.phone || null,
+          recipientAddressSnapshot: customer.address || null,
+          deliveryRequestedAt: deliveryAt,
+          deliveryRequestedRaw: deliveryRaw,
+          status: "NEW",
+        });
+
+        await setConversationState(merchant.id, customer.id, {
+          opted_out: false, // ✅ Reset opted_out après commande
+          order_completed: true,
+          step: "COMPLETED",
+          waiting_field: null,
+          loop_guard: null,
+        });
+        ctx.overrideMessage = `✅ Commande confirmée. Livraison prévue le ${deliveryAt.toLocaleString("fr-FR")}.`;
+        return;
+      }
+
+      // third party
+      if (st.recipient_mode === "third_party") {
+        if (!st.recipient_name) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_name" });
+          ctx.overrideMessage = "Très bien. Donne-moi le *nom et prénom* du destinataire.";
+          return;
+        }
+        if (!st.recipient_phone) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_phone" });
+          ctx.overrideMessage = "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX).";
+          return;
+        }
+        if (!st.recipient_address) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_address" });
+          ctx.overrideMessage = "Merci. Et l'*adresse de livraison* du destinataire ?";
+          return;
+        }
+
+        const recipientPhone = normalizeE164(st.recipient_phone);
+        const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
+
+        if (recipient && st.recipient_name) await updateCustomerField(merchant.id, recipient.id, "name", st.recipient_name);
+        if (recipient && st.recipient_address) await updateCustomerField(merchant.id, recipient.id, "address", st.recipient_address);
+
+        await createOrderFromCart(merchant.id, customer.id, {
+          recipientCustomerId: recipient?.id || null,
+          recipientNameSnapshot: st.recipient_name,
+          recipientPhoneSnapshot: recipientPhone,
+          recipientAddressSnapshot: st.recipient_address,
+          deliveryRequestedAt: deliveryAt,
+          deliveryRequestedRaw: deliveryRaw,
+          status: "NEW",
+        });
+
+        await setConversationState(merchant.id, customer.id, {
+          opted_out: false, // ✅ Reset opted_out après commande
+          order_completed: true,
+          step: "COMPLETED",
+          waiting_field: null,
+          loop_guard: null,
+        });
+        ctx.overrideMessage = `✅ Commande confirmée pour ${st.recipient_name}. Livraison le ${deliveryAt.toLocaleString("fr-FR")}.`;
+        return;
+      }
+
+      await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
+      ctx.overrideMessage = "Parfait ✅ C'est pour vous-même (1) ou pour une autre personne (2) ?";
+      return;
+    }
+
+    default:
+      console.warn("⚠️ Action inconnue", action);
+      return;
+  }
+}
+
+// ================================
+// Moteur commun (utilisé par WAHA + Postman)
 // ================================
 async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const customer = await findOrCreateCustomer(merchant.id, from);
-  const cart = await getCart(merchant.id, customer.id);
-  const products = await getProductsForMerchant(merchant.id);
-  const conversationState = (await getConversationState(merchant.id, customer.id)) || {};
+  const conversationState = await getConversationState(merchant.id, customer.id);
 
-  // ✅ Anti-boucle : si on attend un champ précis, on le gère ici
-  const structured = await tryHandleStructuredReply({
-    merchant,
-    customer,
-    text,
-    conversationState,
-  });
+  // ✅ silence si opt-out déjà activé (sauf réactivation)
+  if (conversationState?.opted_out && !isReactivationMessage(text)) {
+    return { message: null, actions: [] };
+  }
 
+  // ✅ 1) Réponses structurées (sans IA)
+  const structured = await tryHandleStructuredReply({ merchant, customer, text, conversationState });
   if (structured.handled) {
-    const msg = String(structured.message || "").trim();
-    if (msg) {
+    if (structured.message) {
       await sendWhatsappMessage({
         merchant,
         chatId: replyChatId,
         to: from,
-        text: msg,
+        text: structured.message,
       });
     }
-    return { message: msg, actions: [] };
+    return { message: structured.message || null, actions: [] };
   }
 
-  // ✅ Payload EXACT attendu par ton workflow n8n :
-  const agentInput = {
-    message: String(text || ""),
-    merchant: { id: merchant.id, name: merchant.name },
-    customer: {
-      id: customer.id,
-      phone: customer.phone,
-      name: customer.name,
-      address: customer.address,
-      payment_method: customer.payment_method,
-    },
-    cart,
-    products,
-    conversation_state: conversationState,
-  };
+  const cart = await getCart(merchant.id, customer.id);
+  const products = await getProductsForMerchant(merchant.id);
 
-  let agentOutput;
+  let agentOutput = null;
   try {
-    agentOutput = await callCommandBot(agentInput); // ⚠️ IMPORTANT : pas de re-wrapper ici
+    agentOutput = await callCommandBot({
+      message: text,
+      merchant: { id: merchant.id, name: merchant.name },
+      customer: {
+        id: customer.id,
+        phone: customer.phone,
+        name: customer.name,
+        known_fields: {
+          address: customer.address,
+          payment_method: customer.payment_method,
+        },
+      },
+      cart,
+      products,
+      conversation_state: conversationState,
+    });
   } catch (e) {
     console.error("❌ callCommandBot error:", e);
-    agentOutput = { message: "Désolé, souci technique. Réessayez svp 🙏", actions: [] };
+    agentOutput = { message: "Désolé, j'ai eu un souci technique. Réessaie dans un instant.", actions: [] };
   }
 
   const actions = Array.isArray(agentOutput?.actions) ? agentOutput.actions : [];
@@ -779,10 +861,9 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
     await applyAction(action, ctx);
   }
 
-  const outgoingMsg =
-    (ctx.overrideMessage && String(ctx.overrideMessage).trim()) ||
-    (agentOutput?.message ? String(agentOutput.message).trim() : "");
+  const outgoingMsg = (ctx.overrideMessage || agentOutput?.message || "").toString().trim();
 
+  // ✅ si message vide => ne rien envoyer (utile pour STOP)
   if (outgoingMsg) {
     await sendWhatsappMessage({
       merchant,
@@ -796,7 +877,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 }
 
 // ================================
-// Webhook test Postman
+// Webhook "test" (Postman)
 // ================================
 app.post("/webhook/whatsapp", async (req, res) => {
   try {
@@ -826,7 +907,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
 });
 
 // ================================
-// Webhook WAHA
+// Webhook WAHA (production)
 // ================================
 app.post("/webhook/waha", async (req, res) => {
   try {
@@ -842,7 +923,7 @@ app.post("/webhook/waha", async (req, res) => {
     const merchant = await findMerchantByWahaSession(sessionName);
     if (!merchant) return res.sendStatus(200);
 
-    const text = String(pickTextFromWaha(eventWrap) || "").trim();
+    const text = (p?.body ?? p?.text ?? p?.message?.text ?? p?.message ?? "").toString().trim();
     if (!text) return res.sendStatus(200);
 
     const rawFrom = p?.from || p?.sender?.id || p?.author || p?.participant;
@@ -851,12 +932,19 @@ app.post("/webhook/waha", async (req, res) => {
     const fromChatId = normalizeWahaChatId(rawFrom);
     const chatId = normalizeWahaChatId(rawChatId);
 
-    if (isStatusBroadcast(fromChatId) || isStatusBroadcast(chatId)) return res.sendStatus(200);
+    if (
+      (fromChatId && String(fromChatId).includes("status@broadcast")) ||
+      (chatId && String(chatId).includes("status@broadcast"))
+    ) {
+      return res.sendStatus(200);
+    }
 
     const replyChatId = chatId && chatId.endsWith("@g.us") ? chatId : fromChatId;
     if (!replyChatId) return res.sendStatus(200);
 
-    let fromPhone = chatIdToPhone(fromChatId) || normalizePhone(rawFrom) || String(fromChatId || replyChatId);
+    let fromPhone = chatIdToPhone(fromChatId);
+    if (!fromPhone) fromPhone = normalizePhone(rawFrom);
+    if (!fromPhone) fromPhone = String(fromChatId || replyChatId);
 
     await handleIncomingMessage({
       from: fromPhone,
@@ -873,38 +961,204 @@ app.post("/webhook/waha", async (req, res) => {
 });
 
 // ================================
-// Admin Auth
+// Merchant Auth (login/register)
+// ================================
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "Email et mot de passe sont obligatoires." });
+
+    const merchant = await findMerchantByEmail(email);
+    if (!merchant || !merchant.password_hash) return res.status(401).json({ error: "Identifiants invalides." });
+
+    const ok = await bcrypt.compare(password, merchant.password_hash);
+    if (!ok) return res.status(401).json({ error: "Identifiants invalides." });
+
+    const token = jwt.sign({ merchantId: merchant.id }, JWT_SECRET, { expiresIn: "7d" });
+
+    return res.json({ token, merchant: { id: merchant.id, name: merchant.name, email: merchant.email } });
+  } catch (e) {
+    console.error("Erreur /api/auth/login", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { name, email, password, whatsapp_number } = req.body || {};
+    if (!name || !email || !password || !whatsapp_number) {
+      return res.status(400).json({ error: "Champs requis: name, email, password, whatsapp_number" });
+    }
+
+    const existing = await findMerchantByEmail(email);
+    if (existing) return res.status(400).json({ error: "Cet email est déjà utilisé." });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const merchant = await createMerchant({
+      name,
+      email,
+      passwordHash,
+      whatsappNumber: whatsapp_number,
+    });
+
+    const token = jwt.sign({ merchantId: merchant.id }, JWT_SECRET, { expiresIn: "7d" });
+
+    return res.json({ token, merchant: { id: merchant.id, name: merchant.name, email: merchant.email } });
+  } catch (e) {
+    console.error("Erreur /api/auth/register", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// ================================
+// Merchant API (products/orders) - protégée
+// ================================
+app.get("/api/merchants/:merchantId/products", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const products = await getProductsForMerchant(merchantId);
+    return res.json(products);
+  } catch (e) {
+    console.error("Erreur GET products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.post("/api/merchants/:merchantId/products", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const { name, price, description, currency, code, category, image_url } = req.body || {};
+
+    if (!name || price == null) return res.status(400).json({ error: "Les champs 'name' et 'price' sont obligatoires." });
+
+    const product = await createProductForMerchant(merchantId, {
+      name,
+      price,
+      description,
+      currency,
+      code,
+      category,
+      image_url,
+    });
+
+    return res.status(201).json(product);
+  } catch (e) {
+    console.error("Erreur POST products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.put("/api/merchants/:merchantId/products/:productId", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const productId = Number(req.params.productId);
+
+    const { name, price, description, currency, code, category, image_url, is_active } = req.body || {};
+    if (!name || price == null) return res.status(400).json({ error: "Les champs 'name' et 'price' sont obligatoires." });
+
+    const updated = await updateProductForMerchant(merchantId, productId, {
+      name,
+      description,
+      price,
+      currency,
+      code,
+      category,
+      image_url,
+      is_active,
+    });
+
+    if (!updated) return res.status(404).json({ error: "Produit non trouvé pour ce marchand" });
+    return res.json(updated);
+  } catch (e) {
+    console.error("Erreur PUT products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.delete("/api/merchants/:merchantId/products/:productId", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const productId = Number(req.params.productId);
+
+    await deleteProductForMerchant(merchantId, productId);
+    return res.status(204).send();
+  } catch (e) {
+    console.error("Erreur DELETE products", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.get("/api/merchants/:merchantId/orders", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const orders = await getOrdersForMerchant(merchantId);
+    return res.json(orders);
+  } catch (e) {
+    console.error("Erreur GET orders", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.get("/api/merchants/:merchantId/orders/:orderId", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const orderId = Number(req.params.orderId);
+
+    const data = await getOrderWithItems(merchantId, orderId);
+    if (!data) return res.status(404).json({ error: "Commande introuvable" });
+
+    return res.json(data);
+  } catch (e) {
+    console.error("Erreur GET order detail", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.put("/api/merchants/:merchantId/orders/:orderId/status", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
+  try {
+    const merchantId = Number(req.params.merchantId);
+    const orderId = Number(req.params.orderId);
+    const { status } = req.body || {};
+    if (!status) return res.status(400).json({ error: "Le champ 'status' est obligatoire." });
+
+    const updated = await updateOrderStatus(merchantId, orderId, status);
+    if (!updated) return res.status(404).json({ error: "Commande introuvable" });
+
+    return res.json(updated);
+  } catch (e) {
+    console.error("Erreur PUT order status", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// ================================
+// Admin Auth + Admin API
 // ================================
 app.post("/api/admin/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
 
-    const adminEmail = process.env.ADMIN_EMAIL || "admin@local";
-    const adminHash = process.env.ADMIN_PASSWORD_HASH || null;
-    const adminPlain = process.env.ADMIN_PASSWORD || null;
+    if (!ADMIN_EMAIL || !ADMIN_PASSWORD_HASH) {
+      return res.status(500).json({ error: "ADMIN_EMAIL / ADMIN_PASSWORD_HASH non configurés" });
+    }
 
-    if (String(email).toLowerCase() !== String(adminEmail).toLowerCase()) {
+    if (String(email).toLowerCase() !== String(ADMIN_EMAIL).toLowerCase()) {
       return res.status(401).json({ error: "Identifiants invalides" });
     }
 
-    let ok = false;
-    if (adminHash) ok = await bcrypt.compare(password, adminHash);
-    else if (adminPlain) ok = password === adminPlain;
-
+    const ok = await bcrypt.compare(password, ADMIN_PASSWORD_HASH);
     if (!ok) return res.status(401).json({ error: "Identifiants invalides" });
 
-    const token = jwt.sign({ role: "admin", email: adminEmail }, JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ token, admin: { email: adminEmail } });
+    const token = jwt.sign({ role: "admin", email: ADMIN_EMAIL }, JWT_SECRET, { expiresIn: "7d" });
+    return res.json({ token, admin: { email: ADMIN_EMAIL } });
   } catch (e) {
     console.error("Erreur /api/admin/login", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-// ================================
-// Admin Dashboard + Merchants
-// ================================
 app.get("/api/admin/dashboard", adminAuthMiddleware, async (req, res) => {
   try {
     const data = await adminGetDashboard();
@@ -926,53 +1180,53 @@ app.get("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
   }
 });
 
-app.put("/api/admin/merchants/:id/suspend", adminAuthMiddleware, async (req, res) => {
+app.put("/api/admin/merchants/:merchantId/suspend", adminAuthMiddleware, async (req, res) => {
   try {
-    const id = Number(req.params.id);
+    const merchantId = Number(req.params.merchantId);
     const { is_suspended } = req.body || {};
-    const updated = await adminSetMerchantSuspended(id, !!is_suspended);
+
+    const updated = await adminSetMerchantSuspended(merchantId, !!is_suspended);
     if (!updated) return res.status(404).json({ error: "Marchand introuvable" });
+
     return res.json(updated);
   } catch (e) {
-    console.error("Erreur PUT /api/admin/merchants/:id/suspend", e);
+    console.error("Erreur PUT /api/admin/merchants/:merchantId/suspend", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-app.post("/api/admin/merchants/:id/payments", adminAuthMiddleware, async (req, res) => {
+app.post("/api/admin/merchants/:merchantId/payments", adminAuthMiddleware, async (req, res) => {
   try {
-    const id = Number(req.params.id);
+    const merchantId = Number(req.params.merchantId);
     const { amount = 15000, months = 1, method = null, reference = null, note = null } = req.body || {};
 
-    const result = await adminAddSubscriptionPayment(id, { amount, months, method, reference, note });
+    const result = await adminAddSubscriptionPayment(merchantId, { amount, months, method, reference, note });
     if (!result) return res.status(404).json({ error: "Marchand introuvable" });
 
     return res.json({ payment: result.payment, merchant: result.merchant });
   } catch (e) {
-    console.error("Erreur POST /api/admin/merchants/:id/payments", e);
+    console.error("Erreur POST /api/admin/merchants/:merchantId/payments", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-app.get("/api/admin/merchants/:id/payments", adminAuthMiddleware, async (req, res) => {
+app.get("/api/admin/merchants/:merchantId/payments", adminAuthMiddleware, async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    const data = await adminListSubscriptionPayments(id);
+    const merchantId = Number(req.params.merchantId);
+    const data = await adminListSubscriptionPayments(merchantId);
     return res.json(data);
   } catch (e) {
-    console.error("Erreur GET /api/admin/merchants/:id/payments", e);
+    console.error("Erreur GET /api/admin/merchants/:merchantId/payments", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-// créer merchant (admin)
 app.post("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
   try {
     const { name, email, password, whatsapp_number, waha_session } = req.body || {};
+
     if (!name || !email || !password || !whatsapp_number || !waha_session) {
-      return res.status(400).json({
-        error: "Champs requis: name, email, password, whatsapp_number, waha_session",
-      });
+      return res.status(400).json({ error: "Champs requis: name, email, password, whatsapp_number, waha_session" });
     }
 
     const existing = await findMerchantByEmail(email);
@@ -991,20 +1245,18 @@ app.post("/api/admin/merchants", adminAuthMiddleware, async (req, res) => {
     return res.status(201).json({ merchant });
   } catch (e) {
     console.error("Erreur POST /api/admin/merchants", e);
+    if (e.code === "23505") {
+      return res.status(400).json({ error: "Collision: email/whatsapp/session déjà utilisé", details: e.detail });
+    }
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-// lier merchant à WAHA
 app.put("/api/admin/merchants/:merchantId/waha", adminAuthMiddleware, async (req, res) => {
   try {
     const merchantId = Number(req.params.merchantId);
-    if (Number.isNaN(merchantId)) return res.status(400).json({ error: "merchantId invalide" });
-
     const { whatsapp_number, waha_session } = req.body || {};
-    if (!whatsapp_number && !waha_session) {
-      return res.status(400).json({ error: "Fournis whatsapp_number et/ou waha_session" });
-    }
+    if (!whatsapp_number && !waha_session) return res.status(400).json({ error: "Fournis whatsapp_number et/ou waha_session" });
 
     const updated = await updateMerchantWahaConfig(merchantId, {
       whatsappNumber: whatsapp_number,
@@ -1014,231 +1266,19 @@ app.put("/api/admin/merchants/:merchantId/waha", adminAuthMiddleware, async (req
     if (!updated) return res.status(404).json({ error: "Marchand introuvable" });
     return res.json({ merchant: updated });
   } catch (e) {
-    console.error("Erreur PUT /api/admin/merchants/:id/waha", e);
+    console.error("Erreur PUT /api/admin/merchants/:merchantId/waha", e);
+    if (e.code === "23505") {
+      return res.status(400).json({ error: "whatsapp_number ou waha_session déjà pris", details: e.detail });
+    }
     return res.status(500).json({ error: "Erreur serveur" });
   }
-});
-
-// ================================
-// Auth merchants (login/register)
-// ================================
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: "Email et mot de passe obligatoires." });
-
-    const merchant = await findMerchantByEmail(email);
-    if (!merchant || !merchant.password_hash) return res.status(401).json({ error: "Identifiants invalides." });
-
-    const ok = await bcrypt.compare(password, merchant.password_hash);
-    if (!ok) return res.status(401).json({ error: "Identifiants invalides." });
-
-    const token = jwt.sign({ merchantId: merchant.id }, JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ token, merchant: { id: merchant.id, name: merchant.name, email: merchant.email } });
-  } catch (e) {
-    console.error("Erreur /api/auth/login", e);
-    return res.status(500).json({ error: "Erreur serveur" });
-  }
-});
-
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password, whatsapp_number } = req.body || {};
-    if (!name || !email || !password || !whatsapp_number) {
-      return res.status(400).json({ error: "name, email, password, whatsapp_number obligatoires." });
-    }
-
-    const existing = await findMerchantByEmail(email);
-    if (existing) return res.status(400).json({ error: "Cet email est déjà utilisé." });
-
-    const passwordHash = await bcrypt.hash(password, 10);
-    const merchant = await createMerchant({
-      name,
-      email,
-      passwordHash,
-      whatsappNumber: whatsapp_number,
-    });
-
-    const token = jwt.sign({ merchantId: merchant.id }, JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ token, merchant: { id: merchant.id, name: merchant.name, email: merchant.email } });
-  } catch (e) {
-    console.error("Erreur /api/auth/register", e);
-    return res.status(500).json({ error: "Erreur serveur" });
-  }
-});
-
-// ================================
-// Products
-// ================================
-app.get(
-  "/api/merchants/:merchantId/products",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const products = await getProductsForMerchant(merchantId);
-      return res.json(products);
-    } catch (e) {
-      console.error("Erreur GET products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
-);
-
-app.post(
-  "/api/merchants/:merchantId/products",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const { name, price, description, currency, code, category, image_url } = req.body || {};
-
-      if (!name || price == null) return res.status(400).json({ error: "name et price obligatoires." });
-
-      const product = await createProductForMerchant(merchantId, {
-        name,
-        price,
-        description,
-        currency,
-        code,
-        category,
-        image_url,
-      });
-
-      return res.status(201).json(product);
-    } catch (e) {
-      console.error("Erreur POST products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
-);
-
-app.put(
-  "/api/merchants/:merchantId/products/:productId",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const productId = Number(req.params.productId);
-
-      const { name, price, description, currency, code, category, image_url, is_active } = req.body || {};
-      if (!name || price == null) return res.status(400).json({ error: "name et price obligatoires." });
-
-      const updated = await updateProductForMerchant(merchantId, productId, {
-        name,
-        description,
-        price,
-        currency,
-        code,
-        category,
-        image_url,
-        is_active,
-      });
-
-      if (!updated) return res.status(404).json({ error: "Produit non trouvé" });
-      return res.json(updated);
-    } catch (e) {
-      console.error("Erreur PUT products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
-);
-
-app.delete(
-  "/api/merchants/:merchantId/products/:productId",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const productId = Number(req.params.productId);
-
-      await deleteProductForMerchant(merchantId, productId);
-      return res.status(204).send();
-    } catch (e) {
-      console.error("Erreur DELETE products", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
+}
 );
 
 // ================================
-// Orders
-// ================================
-app.get(
-  "/api/merchants/:merchantId/orders",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const orders = await getOrdersForMerchant(merchantId);
-      return res.json(orders);
-    } catch (e) {
-      console.error("Erreur GET orders", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
-);
-
-app.get(
-  "/api/merchants/:merchantId/orders/:orderId",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const orderId = Number(req.params.orderId);
-
-      const data = await getOrderWithItems(merchantId, orderId);
-      if (!data) return res.status(404).json({ error: "Commande introuvable" });
-
-      return res.json(data);
-    } catch (e) {
-      console.error("Erreur GET order details", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
-);
-
-app.put(
-  "/api/merchants/:merchantId/orders/:orderId/status",
-  authMiddleware,
-  requireSameMerchant,
-  subscriptionGate,
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const orderId = Number(req.params.orderId);
-      const { status } = req.body || {};
-      if (!status) return res.status(400).json({ error: "status obligatoire" });
-
-      const updated = await updateOrderStatus(merchantId, orderId, status);
-      if (!updated) return res.status(404).json({ error: "Commande introuvable" });
-
-      return res.json(updated);
-    } catch (e) {
-      console.error("Erreur PUT order status", e);
-      return res.status(500).json({ error: "Erreur serveur" });
-    }
-  }
-);
-
-// ================================
-// Start
+// Start server
 // ================================
 const listenPort = Number(process.env.PORT || PORT || 3000);
 app.listen(listenPort, "0.0.0.0", () => {
   console.log("✅ Serveur démarré sur le port", listenPort);
-  console.log("✅ ADMIN_EMAIL =", process.env.ADMIN_EMAIL || "(non défini)");
-  console.log("✅ ADMIN_PASSWORD_HASH =", process.env.ADMIN_PASSWORD_HASH ? "(OK)" : "(non défini)");
 });
