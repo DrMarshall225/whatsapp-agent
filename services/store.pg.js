@@ -209,75 +209,143 @@ export async function getConversationState(merchantId, customerId) {
 }
 
 /**
- * ✅ setConversationState — MERGE JSONB + RESET quand {} est passé
- *
- * - Si tu envoies state = {} => reset complet (state = {})
- * - Sinon => merge : old_state || patch_state
+ * ✅ CORRECTION #1: setConversationState avec suppression des clés null
+ * 
+ * - Si state = {} => reset complet
+ * - Si state contient des clés avec valeur null => supprimer ces clés
+ * - Sinon => merge intelligent
  */
 export async function setConversationState(merchantId, customerId, state) {
-  const patch = state && typeof state === "object" ? state : {};
-  const patchJson = JSON.stringify(patch);
+  try {
+    const patch = state && typeof state === "object" ? state : {};
+    
+    // ✅ Reset complet si objet vide
+    if (Object.keys(patch).length === 0) {
+      const res = await query(
+        `INSERT INTO conversation_states (merchant_id, customer_id, state)
+         VALUES ($1, $2, '{}'::jsonb)
+         ON CONFLICT (merchant_id, customer_id)
+         DO UPDATE SET state = '{}'::jsonb
+         RETURNING state`,
+        [merchantId, customerId]
+      );
+      return res.rows[0]?.state || {};
+    }
 
-  const res = await query(
-    `
-    INSERT INTO conversation_states (merchant_id, customer_id, state)
-    VALUES ($1, $2, $3::jsonb)
-    ON CONFLICT (merchant_id, customer_id)
-    DO UPDATE SET state =
-      CASE
-        WHEN EXCLUDED.state = '{}'::jsonb
-          THEN '{}'::jsonb
-        ELSE COALESCE(conversation_states.state, '{}'::jsonb) || EXCLUDED.state
-      END
-    RETURNING state
-    `,
-    [merchantId, customerId, patchJson]
-  );
+    // ✅ Lire l'état actuel
+    const current = await getConversationState(merchantId, customerId);
+    
+    // ✅ Merge en JS : supprimer les clés null/undefined
+    const merged = { ...current };
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === null || value === undefined) {
+        delete merged[key];
+      } else {
+        merged[key] = value;
+      }
+    }
 
-  return res.rows[0]?.state || {};
+    // ✅ Réécrire l'état complet
+    const res = await query(
+      `INSERT INTO conversation_states (merchant_id, customer_id, state)
+       VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (merchant_id, customer_id)
+       DO UPDATE SET state = EXCLUDED.state
+       RETURNING state`,
+      [merchantId, customerId, JSON.stringify(merged)]
+    );
+
+    return res.rows[0]?.state || {};
+  } catch (error) {
+    console.error(`[store.pg] setConversationState error:`, {
+      merchantId,
+      customerId,
+      error: error.message,
+    });
+    throw error;
+  }
 }
-
 
 /* =========================
    Cart
 ========================= */
+
+/**
+ * ✅ CORRECTION #2: getCart retourne un objet structuré au lieu d'un array
+ */
 export async function getCart(merchantId, customerId) {
   const res = await query(
-    `SELECT ci.product_id, ci.quantity, p.name, p.price
+    `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price,
+            p.name, p.price, p.currency, p.code, p.category
      FROM cart_items ci
      JOIN products p ON p.id = ci.product_id
      WHERE ci.merchant_id=$1 AND ci.customer_id=$2
      ORDER BY ci.id`,
     [merchantId, customerId]
   );
-  return res.rows;
+
+  const items = res.rows;
+  const total = items.reduce((sum, item) => sum + Number(item.total_price), 0);
+  const currency = items[0]?.currency || "XOF";
+
+  // ✅ Retourner un objet structuré compatible workflow n8n
+  return {
+    items,
+    total_items: items.length,
+    total_amount: total,
+    currency,
+  };
 }
 
+/**
+ * ✅ CORRECTION #3: Vérifier que le produit est actif avant ajout au panier
+ */
 export async function addToCart(merchantId, customerId, productId, quantity) {
-  const productRes = await query(
-    `SELECT price FROM products WHERE id=$1 AND merchant_id=$2`,
-    [productId, merchantId]
-  );
-  if (productRes.rowCount === 0) {
-    throw new Error(`Produit ${productId} introuvable pour marchand ${merchantId}`);
+  try {
+    // ✅ Vérifier que le produit existe ET est actif
+    const productRes = await query(
+      `SELECT price, currency, is_active, name FROM products 
+       WHERE id=$1 AND merchant_id=$2`,
+      [productId, merchantId]
+    );
+    
+    if (productRes.rowCount === 0) {
+      throw new Error(`Produit ${productId} introuvable pour marchand ${merchantId}`);
+    }
+
+    const product = productRes.rows[0];
+    
+    // ✅ Rejeter si produit désactivé
+    if (!product.is_active) {
+      throw new Error(`Produit "${product.name}" (${productId}) n'est plus disponible`);
+    }
+
+    const unitPrice = Number(product.price);
+    const totalPrice = unitPrice * quantity;
+
+    const res = await query(
+      `INSERT INTO cart_items (merchant_id, customer_id, product_id, quantity, unit_price, total_price)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (merchant_id, customer_id, product_id)
+       DO UPDATE SET
+         quantity = cart_items.quantity + EXCLUDED.quantity,
+         unit_price = EXCLUDED.unit_price,
+         total_price = (cart_items.quantity + EXCLUDED.quantity) * EXCLUDED.unit_price
+       RETURNING *`,
+      [merchantId, customerId, productId, quantity, unitPrice, totalPrice]
+    );
+
+    return res.rows[0];
+  } catch (error) {
+    console.error(`[store.pg] addToCart error:`, {
+      merchantId,
+      customerId,
+      productId,
+      quantity,
+      error: error.message,
+    });
+    throw error;
   }
-
-  const unitPrice = Number(productRes.rows[0].price);
-  const totalPrice = unitPrice * quantity;
-
-  const res = await query(
-    `INSERT INTO cart_items (merchant_id, customer_id, product_id, quantity, unit_price, total_price)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (merchant_id, customer_id, product_id)
-     DO UPDATE SET
-       quantity = cart_items.quantity + EXCLUDED.quantity,
-       unit_price = EXCLUDED.unit_price,
-       total_price = (cart_items.quantity + EXCLUDED.quantity) * EXCLUDED.unit_price
-     RETURNING *`,
-    [merchantId, customerId, productId, quantity, unitPrice, totalPrice]
-  );
-
-  return res.rows[0];
 }
 
 export async function removeFromCart(merchantId, customerId, productId) {
@@ -296,7 +364,26 @@ export async function clearCart(merchantId, customerId) {
 /* =========================
    Orders
 ========================= */
-// ✅ Remplace ENTIEREMENT ta fonction createOrderFromCart par celle-ci
+
+/**
+ * ✅ CORRECTION #4: Utiliser une transaction pour créer la commande
+ * 
+ * IMPORTANT: Cette fonction nécessite que votre db.js exporte un pool
+ * avec la méthode .connect() pour obtenir un client dédié.
+ * 
+ * Si votre db.js n'exporte qu'une fonction query(), vous devrez l'adapter.
+ */
+// ============================================
+// REMPLACER LA FONCTION createOrderFromCart
+// dans store.pg.js par cette version
+// ============================================
+
+import { query, withTransaction } from "../db.js";
+
+/**
+ * ✅ VERSION FINALE avec withTransaction (recommandé)
+ * Utilise la fonction helper de db.js pour gérer la transaction
+ */
 export async function createOrderFromCart(merchantId, customerId, opts = {}) {
   const {
     deliveryRequestedAt = null,
@@ -310,86 +397,109 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
     status = "NEW",
   } = opts;
 
-  // 1) lire panier
-  const cartRes = await query(
-    `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price, p.name
-     FROM cart_items ci
-     JOIN products p ON p.id = ci.product_id
-     WHERE ci.merchant_id=$1 AND ci.customer_id=$2`,
-    [merchantId, customerId]
-  );
-  if (cartRes.rowCount === 0) throw new Error("Panier vide");
+  try {
+    // ✅ Utiliser withTransaction de db.js
+    const result = await withTransaction(async (client) => {
+      // 1) lire panier avec lock
+      const cartRes = await client.query(
+        `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price, p.name
+         FROM cart_items ci
+         JOIN products p ON p.id = ci.product_id
+         WHERE ci.merchant_id=$1 AND ci.customer_id=$2
+         FOR UPDATE`,
+        [merchantId, customerId]
+      );
+      
+      if (cartRes.rowCount === 0) {
+        throw new Error("Panier vide");
+      }
 
-  const items = cartRes.rows;
-  const totalAmount = items.reduce((sum, it) => sum + Number(it.total_price), 0);
-  const currency = "XOF";
+      const items = cartRes.rows;
+      const totalAmount = items.reduce((sum, it) => sum + Number(it.total_price), 0);
+      const currency = "XOF";
 
-  // 2) snapshot infos client (adresse / paiement)
-  const customerRes = await query(
-    `SELECT address, payment_method, name, phone
-     FROM customers
-     WHERE id=$1 AND merchant_id=$2`,
-    [customerId, merchantId]
-  );
-  const customerRow = customerRes.rows[0] || {};
-  const deliveryAddress = customerRow.address || null;
-  const paymentMethodSnapshot = customerRow.payment_method || null;
+      // 2) snapshot infos client
+      const customerRes = await client.query(
+        `SELECT address, payment_method FROM customers
+         WHERE id=$1 AND merchant_id=$2`,
+        [customerId, merchantId]
+      );
+      
+      const customerRow = customerRes.rows[0] || {};
+      const deliveryAddress = customerRow.address || null;
+      const paymentMethodSnapshot = customerRow.payment_method || null;
 
-  // 3) créer la commande
-  const orderRes = await query(
-    `INSERT INTO orders (
-        merchant_id, customer_id,
-        total_amount, currency, status,
-        delivery_address, payment_method_snapshot,
-        recipient_customer_id,
-        recipient_name_snapshot, recipient_phone_snapshot, recipient_address_snapshot,
-        delivery_requested_at, delivery_requested_raw
-     )
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-     RETURNING *`,
-    [
+      // 3) créer la commande
+      const orderRes = await client.query(
+        `INSERT INTO orders (
+            merchant_id, customer_id,
+            total_amount, currency, status,
+            delivery_address, payment_method_snapshot,
+            recipient_customer_id,
+            recipient_name_snapshot, recipient_phone_snapshot, recipient_address_snapshot,
+            delivery_requested_at, delivery_requested_raw
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         RETURNING *`,
+        [
+          merchantId,
+          customerId,
+          totalAmount,
+          currency,
+          status,
+          deliveryAddress,
+          paymentMethodSnapshot,
+          recipientCustomerId,
+          recipientNameSnapshot,
+          recipientPhoneSnapshot,
+          recipientAddressSnapshot,
+          deliveryRequestedAt,
+          deliveryRequestedRaw,
+        ]
+      );
+
+      const order = orderRes.rows[0];
+
+      // 4) copier order_items
+      const values = [];
+      const params = [order.id];
+
+      items.forEach((item, idx) => {
+        const base = idx * 4 + 2;
+        values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3})`);
+        params.push(item.product_id, item.quantity, item.unit_price, item.total_price);
+      });
+
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+         VALUES ${values.join(", ")}`,
+        params
+      );
+
+      // 5) vider panier
+      await client.query(
+        `DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2`,
+        [merchantId, customerId]
+      );
+
+      // ✅ Retourner les données (le COMMIT sera fait automatiquement)
+      return { order, items };
+    });
+
+    console.log(`[store.pg] ✅ Commande créée: order_id=${result.order.id}, merchant=${merchantId}, customer=${customerId}`);
+    
+    return result;
+    
+  } catch (error) {
+    console.error(`[store.pg] ❌ createOrderFromCart error (transaction rolled back):`, {
       merchantId,
       customerId,
-      totalAmount,
-      currency,
-      status,
-      deliveryAddress,
-      paymentMethodSnapshot,
-
-      recipientCustomerId,
-      recipientNameSnapshot,
-      recipientPhoneSnapshot,
-      recipientAddressSnapshot,
-
-      deliveryRequestedAt,
-      deliveryRequestedRaw,
-    ]
-  );
-
-  const order = orderRes.rows[0];
-
-  // 4) copier order_items
-  const values = [];
-  const params = [order.id];
-
-  items.forEach((item, idx) => {
-    const base = idx * 4 + 2;
-    values.push(`($1, $${base}, $${base + 1}, $${base + 2}, $${base + 3})`);
-    params.push(item.product_id, item.quantity, item.unit_price, item.total_price);
-  });
-
-  await query(
-    `INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
-     VALUES ${values.join(", ")}`,
-    params
-  );
-
-  // 5) vider panier
-  await query(`DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2`, [merchantId, customerId]);
-
-  return { order, items };
+      error: error.message,
+      stack: error.stack,
+    });
+    throw error;
+  }
 }
-
 export async function getOrdersForMerchant(merchantId) {
   const res = await query(
     `SELECT o.id, o.merchant_id, o.customer_id, o.total_amount, o.currency, o.status, o.created_at,
@@ -466,15 +576,38 @@ export async function updateOrderStatus(merchantId, orderId, status) {
 /* =========================
    Customer fields
 ========================= */
-export async function updateCustomerField(merchantId, customerId, field, value) {
-  const allowedFields = ["name", "address", "payment_method"];
-  if (!allowedFields.includes(field)) throw new Error(`Champ non autorisé: ${field}`);
 
-  const res = await query(
-    `UPDATE customers SET ${field}=$1 WHERE id=$2 AND merchant_id=$3 RETURNING *`,
-    [value, customerId, merchantId]
-  );
-  return res.rows[0];
+/**
+ * ✅ CORRECTION #5: Sécuriser contre SQL injection avec mapping strict
+ */
+export async function updateCustomerField(merchantId, customerId, field, value) {
+  // ✅ Mapping strict pour éviter SQL injection
+  const allowedFields = {
+    name: "name",
+    address: "address",
+    payment_method: "payment_method"
+  };
+  
+  const safeField = allowedFields[field];
+  if (!safeField) {
+    throw new Error(`Champ non autorisé: ${field}`);
+  }
+
+  try {
+    const res = await query(
+      `UPDATE customers SET ${safeField}=$1 WHERE id=$2 AND merchant_id=$3 RETURNING *`,
+      [value, customerId, merchantId]
+    );
+    return res.rows[0];
+  } catch (error) {
+    console.error(`[store.pg] updateCustomerField error:`, {
+      merchantId,
+      customerId,
+      field,
+      error: error.message,
+    });
+    throw error;
+  }
 }
 
 export async function updateCustomerProfile(merchantId, customerId, { name, address, payment_method }) {
