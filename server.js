@@ -392,14 +392,14 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
     });
 
     const mapMsg = {
-      name: "Quel est votre **nom complet** ? (ex : "KONE Aïcha")",
-      self_name: "Quel est votre **nom complet** ? (ex : "KONE Aïcha")",
-      recipient_name: "Quel est le **nom complet** du destinataire ? (ex : "KONE Aïcha")",
-      recipient_phone: "Quel est le **numéro WhatsApp** du destinataire ? (ex : 225XXXXXXXXXX)",
-      recipient_address: "Quelle est l'**adresse complète** du destinataire ? (ex : "Cocody Angré …")",
-      delivery_requested_raw: "Donnez la **date/heure de livraison** (ex : 2025-12-10 14:30).",
-      payment_method: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)", // ✅ NOUVEAU
-    };
+  name: "Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")",
+  self_name: "Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")",
+  recipient_name: "Quel est le **nom complet** du destinataire ? (ex : \"KONE Aïcha\")",
+  recipient_phone: "Quel est le **numéro WhatsApp** du destinataire ? (ex : 225XXXXXXXXXX)",
+  recipient_address: "Quelle est l'**adresse complète** du destinataire ? (ex : \"Cocody Angré …\")",
+  delivery_requested_raw: "Donnez la **date/heure de livraison** (ex : 2025-12-10 14:30).",
+  payment_method: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)",
+};
     return { handled: true, message: mapMsg[waiting] || "Je vous écoute 🙂 Peux-tu préciser ?" };
   }
 
@@ -455,7 +455,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
         ...conversationState,
         loop_guard: { key: currentKey, count },
       });
-      return { handled: true, message: "J'ai besoin de votre **nom complet** (ex : "KONE Aïcha")." };
+     return { handled: true, message: "J'ai besoin de votre **nom complet** (ex : \"KONE Aïcha\")." };
     }
     await updateCustomerField(merchant.id, customer.id, "name", clean);
     await setConversationState(merchant.id, customer.id, {
@@ -516,7 +516,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
         ...conversationState,
         loop_guard: { key: currentKey, count },
       });
-      return { handled: true, message: "J'ai besoin du **nom complet** du destinataire (ex : "KONE Aïcha")." };
+     return { handled: true, message: "J'ai besoin du **nom complet** du destinataire (ex : \"KONE Aïcha\")." };
     }
     const nextState = { ...conversationState, recipient_name: clean, waiting_field: "recipient_phone", step: "ASKING_INFO", loop_guard: null };
     await setConversationState(merchant.id, customer.id, nextState);
@@ -553,8 +553,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
         ...conversationState,
         loop_guard: { key: currentKey, count },
       });
-      return { handled: true, message: "J'ai besoin d'une **adresse complète** (ex : "Cocody Angré 8e tranche …")." };
-    }
+      return { handled: true, message: "J'ai besoin d'une **adresse complète** (ex : \"Cocody Angré 8e tranche …\")." };
 
     // ✅ CORRECTION #5: Vérifier payment_method avant de terminer
     const nextState = { ...conversationState, recipient_address: clean, waiting_field: null, loop_guard: null };
@@ -623,14 +622,14 @@ async function applyAction(action, ctx) {
         const st = await getConversationState(merchant.id, customer.id);
         await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: action.field });
 
-        ctx.overrideMessage =
-          action.field === "name"
-            ? "Parfait 🙂 Quel est votre **nom complet** ? (ex : "KONE Aïcha")"
-            : action.field === "address"
-            ? "D'accord 🙂 Quelle est votre **adresse complète** ? (ex : "Cocody Angré 8e tranche …")"
-            : action.field === "payment_method"
-            ? "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)"
-            : "Je vous écoute 🙂 Pouvez-vous préciser ?";
+       ctx.overrideMessage =
+  action.field === "name"
+    ? "Parfait 🙂 Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")"
+    : action.field === "address"
+    ? "D'accord 🙂 Quelle est votre **adresse complète** ? (ex : \"Cocody Angré 8e tranche …\")"
+    : action.field === "payment_method"
+    ? "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)"
+    : "Je vous écoute 🙂 Pouvez-vous préciser ?";
         return;
       }
 
