@@ -800,6 +800,8 @@ async function applyAction(action, ctx) {
       return;
   }
 }
+}
+
 
 // ================================
 // Moteur commun (utilisé par WAHA + Postman)
