@@ -16,9 +16,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000,                         // Timeout si pas de connexion dispo
   
   // ✅ CORRECTION #3: SSL en production (recommandé)
-  ssl: process.env.NODE_ENV === "production" 
-    ? { rejectUnauthorized: false }  // Adapter selon votre config SSL
-    : false,
+  ssl: false,
 });
 
 // ✅ CORRECTION #4: Logs de connexion
