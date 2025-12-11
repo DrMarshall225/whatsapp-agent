@@ -597,21 +597,19 @@ async function applyAction(action, ctx) {
       await clearCart(merchant.id, customer.id);
       return;
 
-    case "SET_STATE": {
-      const patch = action.state || {};
-      const keys = Object.keys(patch);
+   case "SET_STATE": {
+  const patch = action.state || {};
+  const keys = Object.keys(patch);
 
-      // ✅ si state vide => reset complet (comme dans le prompt)
-      if (keys.length === 0) {
-        await setConversationState(merchant.id, customer.id, {});
-        return;
-      }
+  // ✅ Ne rien faire si state vide (au lieu de tout reset)
+  if (keys.length === 0) {
+    return;
+  }
 
-      // ✅ sinon merge pour ne pas perdre last_question/pending_add_to_cart
-      const st = await getConversationState(merchant.id, customer.id);
-      await setConversationState(merchant.id, customer.id, { ...(st || {}), ...patch });
-      return;
-    }
+  const st = await getConversationState(merchant.id, customer.id);
+  await setConversationState(merchant.id, customer.id, { ...(st || {}), ...patch });
+  return;
+}
 
     case "UPDATE_CUSTOMER": {
       const val = (action.value || "").toString().trim();
@@ -805,6 +803,8 @@ async function applyAction(action, ctx) {
 async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const customer = await findOrCreateCustomer(merchant.id, from);
   const conversationState = await getConversationState(merchant.id, customer.id);
+
+  
 
   // ✅ silence si opt-out déjà activé (sauf réactivation)
   if (conversationState?.opted_out && !isReactivationMessage(text)) {
