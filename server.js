@@ -554,7 +554,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
         loop_guard: { key: currentKey, count },
       });
       return { handled: true, message: "J'ai besoin d'une **adresse complète** (ex : \"Cocody Angré 8e tranche …\")." };
-
+    }
     // ✅ CORRECTION #5: Vérifier payment_method avant de terminer
     const nextState = { ...conversationState, recipient_address: clean, waiting_field: null, loop_guard: null };
 
