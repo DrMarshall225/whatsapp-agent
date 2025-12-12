@@ -826,6 +826,14 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   }
 
   const cart = await getCart(merchant.id, customer.id);
+
+console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+console.log("🛒 CART DEBUG:");
+console.log("Type:", Array.isArray(cart) ? "Array" : typeof cart);
+console.log("Length:", Array.isArray(cart) ? cart.length : "N/A");
+console.log("Content:", JSON.stringify(cart, null, 2));
+console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
   const products = await getProductsForMerchant(merchant.id);
 
   let agentOutput = null;
