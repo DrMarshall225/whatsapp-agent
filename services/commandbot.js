@@ -1,4 +1,4 @@
-// services/commandbot.js - VERSION AVEC LOGS DE DEBUG
+// services/commandbot.js - VERSION CORRIGÉE POUR PANIER OBJET
 import axios from "axios";
 import crypto from "crypto";
 
@@ -212,13 +212,44 @@ function shouldRetry(err) {
   return false;
 }
 
+// ✅ FONCTION HELPER POUR NORMALISER LE PANIER
+function normalizeCartForLogs(cart) {
+  // Si cart est un objet avec items
+  if (cart && typeof cart === "object" && !Array.isArray(cart) && Array.isArray(cart.items)) {
+    return {
+      count: cart.items.length,
+      items: cart.items,
+      total: cart.total_amount || 0,
+    };
+  }
+  
+  // Si cart est déjà un array
+  if (Array.isArray(cart)) {
+    return {
+      count: cart.length,
+      items: cart,
+      total: cart.reduce((sum, item) => sum + (item.total_price || item.total || 0), 0),
+    };
+  }
+  
+  // Sinon panier vide
+  return {
+    count: 0,
+    items: [],
+    total: 0,
+  };
+}
+
 // ================================
-// Main - AVEC LOGS DE DEBUG
+// Main - AVEC LOGS DE DEBUG CORRIGÉS
 // ================================
 export async function callCommandBot(agentInput) {
   const requestId = crypto.randomBytes(8).toString("hex");
 
-  // ✅ LOGS DE DEBUG AJOUTÉS ICI
+  // ✅ NORMALISER LE PANIER POUR LES LOGS
+  const cartInfo = normalizeCartForLogs(agentInput.cart);
+
+  // ✅ LOGS DE DEBUG CORRIGÉS
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[CommandBot] (${requestId}) 🔍 DEBUG INPUT`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -236,7 +267,16 @@ export async function callCommandBot(agentInput) {
     console.log("   ⚠️ ATTENTION : Aucun produit envoyé à l'IA !");
   }
   
-  console.log("🛒 Panier:", agentInput.cart?.length || 0, "articles");
+  // ✅ LOG CORRIGÉ DU PANIER
+  console.log("🛒 Panier:", cartInfo.count, "articles");
+  if (cartInfo.count > 0) {
+    console.log("   Items:");
+    cartInfo.items.forEach(item => {
+      console.log(`   - ${item.name} x${item.quantity} (${item.total_price || item.total || 0} XOF)`);
+    });
+    console.log(`   💰 Total: ${cartInfo.total} XOF`);
+  }
+  
   console.log("📊 État:", JSON.stringify(agentInput.conversation_state || {}, null, 2));
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
