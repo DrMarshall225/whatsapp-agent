@@ -825,14 +825,29 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
     return { message: structured.message || null, actions: [] };
   }
 
+  // ✅ CORRECTION CRITIQUE : Récupérer le panier de la DB
   const cart = await getCart(merchant.id, customer.id);
 
-console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-console.log("🛒 CART DEBUG:");
-console.log("Type:", Array.isArray(cart) ? "Array" : typeof cart);
-console.log("Length:", Array.isArray(cart) ? cart.length : "N/A");
-console.log("Content:", JSON.stringify(cart, null, 2));
-console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  // ✅ LOG DE DIAGNOSTIC AJOUTÉ
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("🛒 CART DEBUG (from getCart):");
+  console.log("  Type:", Array.isArray(cart) ? "Array" : typeof cart);
+  console.log("  Length:", Array.isArray(cart) ? cart.length : (cart?.items?.length || "N/A"));
+  if (Array.isArray(cart) && cart.length > 0) {
+    console.log("  Items:");
+    cart.forEach(item => {
+      console.log(`    - ${item.name} x${item.quantity} (${item.total || item.price * item.quantity} XOF)`);
+    });
+  } else if (cart?.items && cart.items.length > 0) {
+    console.log("  Items:");
+    cart.items.forEach(item => {
+      console.log(`    - ${item.name} x${item.quantity} (${item.total || item.price * item.quantity} XOF)`);
+    });
+  } else {
+    console.log("  ⚠️ Panier vide ou format inconnu");
+  }
+  console.log("  Full content:", JSON.stringify(cart, null, 2));
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   const products = await getProductsForMerchant(merchant.id);
 
