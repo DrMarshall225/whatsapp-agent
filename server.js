@@ -125,11 +125,16 @@ function looksLikePhone(val) {
 function looksLikeDelivery(val) {
   if (isAckValue(val)) return false;
   const t = normText(val);
-  // Indices simples (tu peux enrichir au besoin)
+  
+  // Accepter tous ces formats
   return (
+    /\b(aujourd'?hui|auj|ce soir|cet? après[ -]?midi|ce matin)\b/.test(t) ||
+    /\b(demain|tmrw|2moro)\b/.test(t) ||
+    /dans \d+ jours?/.test(t) ||
+    /\d{1,2}\s+(janvier|fevrier|février|mars|avril|mai|juin|juillet|aout|août|septembre|octobre|novembre|decembre|décembre|jan|fev|fév|mar|avr|mai|jun|juil|sept|sep|oct|nov|dec|déc)/i.test(t) ||
     /\d{4}-\d{2}-\d{2}/.test(t) ||
     /\d{2}\/\d{2}\/\d{4}/.test(t) ||
-    /\b(demain|aujourd|auj|ce soir|cet|dans)\b/.test(t) ||
+    /\d{2}-\d{2}-\d{4}/.test(t) ||
     /\b(\d{1,2}h|\d{1,2}:\d{2})\b/.test(t)
   );
 }
@@ -213,35 +218,153 @@ function normalizeE164(input) {
   return digits ? `+${digits}` : null;
 }
 
-// Parse très simple:
-// - "YYYY-MM-DD" ou "YYYY-MM-DD HH:mm"
-// - "DD/MM/YYYY" ou "DD/MM/YYYY HH:mm"
+/**
+ * Parse les dates de livraison dans tous les formats
+ * Formats supportés :
+ * - "aujourd'hui", "auj", "ce soir"
+ * - "demain", "demain matin", "demain soir"
+ * - "30 décembre", "30 dec", "le 30/12"
+ * - "2025-12-30", "30/12/2025"
+ * - "2025-12-30 14:00", "30/12/2025 14h30"
+ */
 function parseDeliveryRequestedAt(rawText) {
   if (!rawText) return null;
-  const s = String(rawText).trim();
-
-  // YYYY-MM-DD [HH:mm]
-  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  
+  const s = String(rawText).trim().toLowerCase();
+  const now = new Date();
+  
+  // ===== FORMAT 1 : AUJOURD'HUI =====
+  if (/\b(aujourd'?hui|auj|ce soir|cet? après[ -]?midi|ce matin)\b/.test(s)) {
+    const result = new Date(now);
+    
+    // Extraire l'heure si présente
+    const hourMatch = s.match(/(\d{1,2})[h:](\d{2})?/);
+    if (hourMatch) {
+      result.setHours(parseInt(hourMatch[1], 10));
+      result.setMinutes(hourMatch[2] ? parseInt(hourMatch[2], 10) : 0);
+    } else if (s.includes("soir")) {
+      result.setHours(19, 0, 0, 0);
+    } else if (s.includes("matin")) {
+      result.setHours(10, 0, 0, 0);
+    } else if (s.includes("après-midi") || s.includes("apres-midi")) {
+      result.setHours(14, 0, 0, 0);
+    } else {
+      result.setHours(14, 0, 0, 0); // Par défaut 14h
+    }
+    
+    result.setSeconds(0, 0);
+    return result;
+  }
+  
+  // ===== FORMAT 2 : DEMAIN =====
+  if (/\b(demain|tmrw|2moro)\b/.test(s)) {
+    const result = new Date(now);
+    result.setDate(result.getDate() + 1);
+    
+    // Extraire l'heure si présente
+    const hourMatch = s.match(/(\d{1,2})[h:](\d{2})?/);
+    if (hourMatch) {
+      result.setHours(parseInt(hourMatch[1], 10));
+      result.setMinutes(hourMatch[2] ? parseInt(hourMatch[2], 10) : 0);
+    } else if (s.includes("soir")) {
+      result.setHours(19, 0, 0, 0);
+    } else if (s.includes("matin")) {
+      result.setHours(10, 0, 0, 0);
+    } else {
+      result.setHours(14, 0, 0, 0); // Par défaut 14h
+    }
+    
+    result.setSeconds(0, 0);
+    return result;
+  }
+  
+  // ===== FORMAT 3 : DANS X JOURS =====
+  const daysMatch = s.match(/dans (\d+) jours?/);
+  if (daysMatch) {
+    const result = new Date(now);
+    result.setDate(result.getDate() + parseInt(daysMatch[1], 10));
+    result.setHours(14, 0, 0, 0);
+    return result;
+  }
+  
+  // ===== FORMAT 4 : JOUR + MOIS (ex: "30 décembre", "15 janvier") =====
+  const monthNames = {
+    'janvier': 0, 'jan': 0,
+    'février': 1, 'fevrier': 1, 'fev': 1, 'fév': 1,
+    'mars': 2, 'mar': 2,
+    'avril': 3, 'avr': 3,
+    'mai': 4,
+    'juin': 5,
+    'juillet': 6, 'juil': 6,
+    'août': 7, 'aout': 7,
+    'septembre': 8, 'sept': 8, 'sep': 8,
+    'octobre': 9, 'oct': 9,
+    'novembre': 10, 'nov': 10,
+    'décembre': 11, 'decembre': 11, 'dec': 11, 'déc': 11
+  };
+  
+  const dayMonthMatch = s.match(/(\d{1,2})\s+(janvier|fevrier|février|mars|avril|mai|juin|juillet|aout|août|septembre|octobre|novembre|decembre|décembre|jan|fev|fév|mar|avr|mai|jun|juil|aout|sept|sep|oct|nov|dec|déc)/i);
+  if (dayMonthMatch) {
+    const day = parseInt(dayMonthMatch[1], 10);
+    const monthName = dayMonthMatch[2].toLowerCase();
+    const month = monthNames[monthName];
+    
+    if (month !== undefined) {
+      const year = now.getFullYear();
+      const result = new Date(year, month, day);
+      
+      // Si la date est dans le passé, on prend l'année prochaine
+      if (result.getTime() < now.getTime()) {
+        result.setFullYear(year + 1);
+      }
+      
+      // Extraire l'heure si présente
+      const hourMatch = s.match(/(\d{1,2})[h:](\d{2})?/);
+      if (hourMatch) {
+        result.setHours(parseInt(hourMatch[1], 10));
+        result.setMinutes(hourMatch[2] ? parseInt(hourMatch[2], 10) : 0);
+      } else {
+        result.setHours(14, 0, 0, 0);
+      }
+      
+      result.setSeconds(0, 0);
+      return result;
+    }
+  }
+  
+  // ===== FORMAT 5 : YYYY-MM-DD [HH:mm] =====
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{1,2})[h:](\d{2}))?$/);
   if (m) {
     const year = Number(m[1]);
     const month = Number(m[2]) - 1;
     const day = Number(m[3]);
-    const hh = m[4] != null ? Number(m[4]) : 10;
+    const hh = m[4] != null ? Number(m[4]) : 14;
     const mm = m[5] != null ? Number(m[5]) : 0;
     return new Date(year, month, day, hh, mm, 0, 0);
   }
-
-  // DD/MM/YYYY [HH:mm]
-  m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  
+  // ===== FORMAT 6 : DD/MM/YYYY [HH:mm] =====
+  m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{1,2})[h:](\d{2}))?$/);
   if (m) {
     const day = Number(m[1]);
     const month = Number(m[2]) - 1;
     const year = Number(m[3]);
-    const hh = m[4] != null ? Number(m[4]) : 10;
+    const hh = m[4] != null ? Number(m[4]) : 14;
     const mm = m[5] != null ? Number(m[5]) : 0;
     return new Date(year, month, day, hh, mm, 0, 0);
   }
-
+  
+  // ===== FORMAT 7 : DD-MM-YYYY [HH:mm] =====
+  m = s.match(/^(\d{2})-(\d{2})-(\d{4})(?:\s+(\d{1,2})[h:](\d{2}))?$/);
+  if (m) {
+    const day = Number(m[1]);
+    const month = Number(m[2]) - 1;
+    const year = Number(m[3]);
+    const hh = m[4] != null ? Number(m[4]) : 14;
+    const mm = m[5] != null ? Number(m[5]) : 0;
+    return new Date(year, month, day, hh, mm, 0, 0);
+  }
+  
   return null;
 }
 
