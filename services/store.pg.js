@@ -1,5 +1,5 @@
 // services/store.pg.js
-import { query } from "../db.js";
+import { query, withTransaction } from "../db.js";
 
 /* =========================
    Normalisers

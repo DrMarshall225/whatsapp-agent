@@ -109,11 +109,22 @@ function looksLikeName(val) {
   return v.length >= 2 && lettersCount(v) >= 2;
 }
 
-// ✅ CORRECTION #1: Harmonisé avec workflow (>= 5 au lieu de >= 6)
+// ✅ NOUVEAU CODE (plus flexible)
 function looksLikeAddress(val) {
   if (isAckValue(val)) return false;
   const v = (val || "").toString().trim();
-  return v.length >= 5 && lettersCount(v) >= 1; // ✅ >= 5 pour accepter "Angré"
+  
+  // Une adresse valide doit :
+  // - Faire au moins 5 caractères
+  // - Contenir au moins 3 lettres
+  // - OU contenir des mots-clés d'adresse
+  const hasMinLength = v.length >= 5;
+  const hasEnoughLetters = lettersCount(v) >= 3;
+  
+  const addressKeywords = /\b(angré|angre|cocody|yopougon|abobo|adjamé|adjame|plateau|marcory|koumassi|treichville|rue|avenue|av|boulevard|bd|quartier|résidence|residence|villa|immeuble|tranche|cite|cité)\b/i;
+  const hasKeyword = addressKeywords.test(v);
+  
+  return hasMinLength && (hasEnoughLetters || hasKeyword);
 }
 
 function looksLikePhone(val) {
@@ -834,78 +845,102 @@ async function applyAction(action, ctx) {
       }
 
       // self
-      if (st.recipient_mode === "self") {
-        if (!customer.name) {
-          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
-          ctx.overrideMessage = "D'accord 🙂 Quel est votre nom (et prénom) ?";
-          return;
-        }
+      // self
+if (st.recipient_mode === "self") {
+  if (!customer.name) {
+    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
+    ctx.overrideMessage = "D'accord 🙂 Quel est votre nom (et prénom) ?";
+    return;
+  }
 
-        await createOrderFromCart(merchant.id, customer.id, {
-          recipientCustomerId: customer.id,
-          recipientNameSnapshot: customer.name,
-          recipientPhoneSnapshot: customer.phone || null,
-          recipientAddressSnapshot: customer.address || null,
-          deliveryRequestedAt: deliveryAt,
-          deliveryRequestedRaw: deliveryRaw,
-          status: "NEW",
-        });
+  // ✅ CRÉER LA COMMANDE
+  await createOrderFromCart(merchant.id, customer.id, {
+    recipientCustomerId: customer.id,
+    recipientNameSnapshot: customer.name,
+    recipientPhoneSnapshot: customer.phone || null,
+    recipientAddressSnapshot: customer.address || null,
+    deliveryRequestedAt: deliveryAt,
+    deliveryRequestedRaw: deliveryRaw,
+    status: "NEW",
+  });
 
-        await setConversationState(merchant.id, customer.id, {
-          opted_out: false, // ✅ Reset opted_out après commande
-          order_completed: true,
-          step: "COMPLETED",
-          waiting_field: null,
-          loop_guard: null,
-        });
-        ctx.overrideMessage = `✅ Commande confirmée. Livraison prévue le ${deliveryAt.toLocaleString("fr-FR")}.`;
-        return;
-      }
+  // ✅ VIDER LE PANIER APRÈS CONFIRMATION
+  await clearCart(merchant.id, customer.id);
+
+  // ✅ RESET COMPLET DU STATE
+  await setConversationState(merchant.id, customer.id, {
+    opted_out: false,
+    order_completed: true,
+    step: "COMPLETED",
+    waiting_field: null,
+    loop_guard: null,
+    recipient_mode: null, // ⬅️ RESET pour prochaine commande
+    delivery_requested_raw: null, // ⬅️ RESET
+    pending_add_to_cart: null, // ⬅️ RESET
+  });
+  
+  ctx.overrideMessage = `✅ Commande confirmée. Livraison prévue le ${deliveryAt.toLocaleString("fr-FR")}. Merci et à bientôt !`;
+  return;
+}
 
       // third party
-      if (st.recipient_mode === "third_party") {
-        if (!st.recipient_name) {
-          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_name" });
-          ctx.overrideMessage = "Très bien. Donne-moi le *nom et prénom* du destinataire.";
-          return;
-        }
-        if (!st.recipient_phone) {
-          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_phone" });
-          ctx.overrideMessage = "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX).";
-          return;
-        }
-        if (!st.recipient_address) {
-          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_address" });
-          ctx.overrideMessage = "Merci. Et l'*adresse de livraison* du destinataire ?";
-          return;
-        }
+if (st.recipient_mode === "third_party") {
+  if (!st.recipient_name) {
+    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_name" });
+    ctx.overrideMessage = "Très bien. Donne-moi le *nom et prénom* du destinataire.";
+    return;
+  }
+  if (!st.recipient_phone) {
+    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_phone" });
+    ctx.overrideMessage = "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX).";
+    return;
+  }
+  if (!st.recipient_address) {
+    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_address" });
+    ctx.overrideMessage = "Merci. Et l'*adresse de livraison* du destinataire ?";
+    return;
+  }
 
-        const recipientPhone = normalizeE164(st.recipient_phone);
-        const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
+  const recipientPhone = normalizeE164(st.recipient_phone);
+  const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
 
-        if (recipient && st.recipient_name) await updateCustomerField(merchant.id, recipient.id, "name", st.recipient_name);
-        if (recipient && st.recipient_address) await updateCustomerField(merchant.id, recipient.id, "address", st.recipient_address);
+  if (recipient && st.recipient_name) 
+    await updateCustomerField(merchant.id, recipient.id, "name", st.recipient_name);
+  if (recipient && st.recipient_address) 
+    await updateCustomerField(merchant.id, recipient.id, "address", st.recipient_address);
 
-        await createOrderFromCart(merchant.id, customer.id, {
-          recipientCustomerId: recipient?.id || null,
-          recipientNameSnapshot: st.recipient_name,
-          recipientPhoneSnapshot: recipientPhone,
-          recipientAddressSnapshot: st.recipient_address,
-          deliveryRequestedAt: deliveryAt,
-          deliveryRequestedRaw: deliveryRaw,
-          status: "NEW",
-        });
+  // ✅ CRÉER LA COMMANDE
+  await createOrderFromCart(merchant.id, customer.id, {
+    recipientCustomerId: recipient?.id || null,
+    recipientNameSnapshot: st.recipient_name,
+    recipientPhoneSnapshot: recipientPhone,
+    recipientAddressSnapshot: st.recipient_address,
+    deliveryRequestedAt: deliveryAt,
+    deliveryRequestedRaw: deliveryRaw,
+    status: "NEW",
+  });
 
-        await setConversationState(merchant.id, customer.id, {
-          opted_out: false, // ✅ Reset opted_out après commande
-          order_completed: true,
-          step: "COMPLETED",
-          waiting_field: null,
-          loop_guard: null,
-        });
-        ctx.overrideMessage = `✅ Commande confirmée pour ${st.recipient_name}. Livraison le ${deliveryAt.toLocaleString("fr-FR")}.`;
-        return;
-      }
+  // ✅ VIDER LE PANIER APRÈS CONFIRMATION
+  await clearCart(merchant.id, customer.id);
+
+  // ✅ RESET COMPLET DU STATE
+  await setConversationState(merchant.id, customer.id, {
+    opted_out: false,
+    order_completed: true,
+    step: "COMPLETED",
+    waiting_field: null,
+    loop_guard: null,
+    recipient_mode: null, // ⬅️ RESET
+    recipient_name: null, // ⬅️ RESET
+    recipient_phone: null, // ⬅️ RESET
+    recipient_address: null, // ⬅️ RESET
+    delivery_requested_raw: null, // ⬅️ RESET
+    pending_add_to_cart: null, // ⬅️ RESET
+  });
+  
+  ctx.overrideMessage = `✅ Commande confirmée pour ${st.recipient_name}. Livraison le ${deliveryAt.toLocaleString("fr-FR")}. Merci et à bientôt !`;
+  return;
+}
 
       await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
       ctx.overrideMessage = "Parfait ✅ C'est pour vous-même (1) ou pour une autre personne (2) ?";
