@@ -273,31 +273,39 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
       throw new Error(`Fichier introuvable: ${filePath}`);
     }
 
-    // ✅ Créer FormData pour upload
-    const FormData = (await import('form-data')).default;
-    const form = new FormData();
+    // ✅ Lire le fichier en base64
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileBase64 = fileBuffer.toString('base64');
     
-    form.append('chatId', chatId);
-    form.append('file', fs.createReadStream(filePath), { filename });
-    if (caption) form.append('caption', caption);
+    // ✅ Détecter le mimetype
+    const mimeType = filename.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream';
 
-    // ✅ CORRECTION : Utiliser le bon endpoint WAHA
-    const url = `${wahaUrl}/api/sendFile`;
+    // ✅ MÊME FORMAT QUE sendText : /api/{session}/sendFile
+    const url = `${wahaUrl}/api/${sessionName}/sendFile`;
     
     console.log('[WAHA] Envoi document:', { 
       session: sessionName, 
       chatId, 
       filename,
-      url 
+      url,
+      fileSize: fileBuffer.length
     });
 
+    // ✅ Envoyer en JSON (comme sendText)
     const response = await fetch(url, {
       method: 'POST',
-      body: form,
       headers: {
-        ...form.getHeaders(),
-        'X-Api-Key': sessionName // ✅ WAHA utilise le session name comme API key
-      }
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: chatId,
+        file: {
+          mimetype: mimeType,
+          filename: filename,
+          data: fileBase64
+        },
+        caption: caption || undefined
+      })
     });
 
     const ok = response.ok;
@@ -310,7 +318,7 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
       filename,
       status, 
       ok,
-      response: data
+      response: JSON.stringify(data).substring(0, 200)
     });
 
     return { ok, status, data };
