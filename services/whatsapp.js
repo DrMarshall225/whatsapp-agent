@@ -259,7 +259,6 @@ export async function sendWhatsappImage({ merchant, chatId, to, imageUrl, captio
  * Envoie un document (PDF, image, etc.) via WhatsApp
  */
 export async function sendWhatsappDocument({ merchant, chatId, to, filePath, filename, caption = '' }) {
-  const wahaUrl = process.env.WAHA_URL || 'http://localhost:3000';
   const sessionName = merchant.waha_session;
 
   if (!sessionName) {
@@ -293,42 +292,38 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
       fileUrl
     });
 
-    // ✅ Essayer avec sendText + lien (fallback simple)
-    const url = `${wahaUrl}/api/sendText`;
+    // ✅ Normaliser le chatId (comme dans sendWhatsappMessage)
+    const finalChatId = normalizeChatId(chatId) || normalizeChatId(to);
     
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        session: sessionName,
-        chatId: chatId,
-        text: `📄 *${filename}*\n\n${caption}\n\n🔗 Télécharger : ${fileUrl}`
-      })
-    });
+    if (!finalChatId) {
+      throw new Error("Missing chatId/to");
+    }
 
-    const ok = response.ok;
-    const status = response.status;
-    const data = await response.json().catch(() => ({}));
+    // ✅ UTILISER LA MÊME FONCTION HELPER
+    const payload = {
+      session: sessionName,
+      chatId: finalChatId,
+      text: `📄 *${filename}*\n\n${caption}\n\n🔗 Télécharger : ${fileUrl}`
+    };
+
+    const result = await sendWahaMessage("/api/sendText", payload, 10000);
 
     console.log('[WAHA] Document envoyé:', { 
       session: sessionName, 
-      chatId, 
+      chatId: finalChatId, 
       filename,
-      status, 
-      ok
+      result
     });
 
-    // ✅ Nettoyer le fichier public après 1 minute
+    // ✅ Nettoyer le fichier public après 5 minutes
     setTimeout(() => {
       if (fs.existsSync(publicPath)) {
         fs.unlinkSync(publicPath);
         console.log(`[PDF] 🗑️ Fichier public nettoyé: ${publicPath}`);
       }
-    }, 60000);
+    }, 300000);
 
-    return { ok, status, data };
+    return result;
 
   } catch (error) {
     console.error('[WAHA] Erreur envoi document:', error);
