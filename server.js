@@ -49,12 +49,26 @@ import {
 } from "./services/store.pg.js";
 
 import { callCommandBot } from "./services/commandbot.js";
-import { sendWhatsappMessage } from "./services/whatsapp.js";
+import { sendWhatsappMessage, sendWhatsappDocument } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 import { generateCatalogPDF, cleanupPDF } from './services/catalog-pdf.js';
+import { query } from "./db.js";
 
 import multer from 'multer';
 import path from 'path';
+
+// ================================
+// Config
+// ================================
+const app = express();
+app.use(cors());
+app.use(bodyParser.json({ limit: "5mb" }));
+
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
+
+// Admin credentials (prod conseillé)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // ex: admin@dido.com
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt hash
 
 // Servir les fichiers uploads (logos, etc.)
 app.use('/uploads', express.static('/var/www/uploads'));
@@ -83,53 +97,6 @@ const uploadLogo = multer({
     }
   }
 });
-
-// Route pour upload logo
-app.post(
-  '/api/merchants/:merchantId/logo',
-  authMiddleware,
-  requireSameMerchant,
-  uploadLogo.single('logo'),
-  async (req, res) => {
-    try {
-      const merchantId = Number(req.params.merchantId);
-      const logoUrl = `https://92.112.193.171/uploads/logos/${req.file.filename}`;
-      
-      // Mettre à jour en base
-      const result = await query(
-        'UPDATE merchants SET logo_url = $1 WHERE id = $2 RETURNING id, name, logo_url',
-        [logoUrl, merchantId]
-      );
-      
-      if (result.rowCount === 0) {
-        return res.status(404).json({ error: 'Marchand introuvable' });
-      }
-      
-      return res.json({ 
-        success: true, 
-        logo_url: logoUrl,
-        merchant: result.rows[0]
-      });
-      
-    } catch (error) {
-      console.error('Erreur upload logo:', error);
-      return res.status(500).json({ error: 'Erreur serveur' });
-    }
-  }
-);
-
-// ================================
-// Config
-// ================================
-const app = express();
-app.use(cors());
-app.use(bodyParser.json({ limit: "5mb" }));
-
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
-
-// Admin credentials (prod conseillé)
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // ex: admin@dido.com
-const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt hash
 
 // ================================
 // Helpers (Validation & Anti-ACK)
@@ -592,14 +559,14 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
     });
 
     const mapMsg = {
-  name: "Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")",
-  self_name: "Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")",
-  recipient_name: "Quel est le **nom complet** du destinataire ? (ex : \"KONE Aïcha\")",
-  recipient_phone: "Quel est le **numéro WhatsApp** du destinataire ? (ex : 225XXXXXXXXXX)",
-  recipient_address: "Quelle est l'**adresse complète** du destinataire ? (ex : \"Cocody Angré …\")",
-  delivery_requested_raw: "Donnez la **date/heure de livraison** (ex : 2025-12-10 14:30).",
-  payment_method: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)",
-};
+      name: "Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")",
+      self_name: "Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")",
+      recipient_name: "Quel est le **nom complet** du destinataire ? (ex : \"KONE Aïcha\")",
+      recipient_phone: "Quel est le **numéro WhatsApp** du destinataire ? (ex : 225XXXXXXXXXX)",
+      recipient_address: "Quelle est l'**adresse complète** du destinataire ? (ex : \"Cocody Angré …\")",
+      delivery_requested_raw: "Donnez la **date/heure de livraison** (ex : 2025-12-10 14:30).",
+      payment_method: "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)",
+    };
     return { handled: true, message: mapMsg[waiting] || "Je vous écoute 🙂 Peux-tu préciser ?" };
   }
 
@@ -655,7 +622,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
         ...conversationState,
         loop_guard: { key: currentKey, count },
       });
-     return { handled: true, message: "J'ai besoin de votre **nom complet** (ex : \"KONE Aïcha\")." };
+      return { handled: true, message: "J'ai besoin de votre **nom complet** (ex : \"KONE Aïcha\")." };
     }
     await updateCustomerField(merchant.id, customer.id, "name", clean);
     await setConversationState(merchant.id, customer.id, {
@@ -716,7 +683,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
         ...conversationState,
         loop_guard: { key: currentKey, count },
       });
-     return { handled: true, message: "J'ai besoin du **nom complet** du destinataire (ex : \"KONE Aïcha\")." };
+      return { handled: true, message: "J'ai besoin du **nom complet** du destinataire (ex : \"KONE Aïcha\")." };
     }
     const nextState = { ...conversationState, recipient_name: clean, waiting_field: "recipient_phone", step: "ASKING_INFO", loop_guard: null };
     await setConversationState(merchant.id, customer.id, nextState);
@@ -797,19 +764,19 @@ async function applyAction(action, ctx) {
       await clearCart(merchant.id, customer.id);
       return;
 
-   case "SET_STATE": {
-  const patch = action.state || {};
-  const keys = Object.keys(patch);
+    case "SET_STATE": {
+      const patch = action.state || {};
+      const keys = Object.keys(patch);
 
-  // ✅ Ne rien faire si state vide (au lieu de tout reset)
-  if (keys.length === 0) {
-    return;
-  }
+      // ✅ Ne rien faire si state vide (au lieu de tout reset)
+      if (keys.length === 0) {
+        return;
+      }
 
-  const st = await getConversationState(merchant.id, customer.id);
-  await setConversationState(merchant.id, customer.id, { ...(st || {}), ...patch });
-  return;
-}
+      const st = await getConversationState(merchant.id, customer.id);
+      await setConversationState(merchant.id, customer.id, { ...(st || {}), ...patch });
+      return;
+    }
 
     case "UPDATE_CUSTOMER": {
       const val = (action.value || "").toString().trim();
@@ -820,14 +787,14 @@ async function applyAction(action, ctx) {
         const st = await getConversationState(merchant.id, customer.id);
         await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: action.field });
 
-       ctx.overrideMessage =
-  action.field === "name"
-    ? "Parfait 🙂 Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")"
-    : action.field === "address"
-    ? "D'accord 🙂 Quelle est votre **adresse complète** ? (ex : \"Cocody Angré 8e tranche …\")"
-    : action.field === "payment_method"
-    ? "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)"
-    : "Je vous écoute 🙂 Pouvez-vous préciser ?";
+        ctx.overrideMessage =
+          action.field === "name"
+            ? "Parfait 🙂 Quel est votre **nom complet** ? (ex : \"KONE Aïcha\")"
+            : action.field === "address"
+            ? "D'accord 🙂 Quelle est votre **adresse complète** ? (ex : \"Cocody Angré 8e tranche …\")"
+            : action.field === "payment_method"
+            ? "Merci ✅ Quel mode de paiement souhaitez-vous ? (cash, Wave, Orange Money, MTN, carte…)"
+            : "Je vous écoute 🙂 Pouvez-vous préciser ?";
         return;
       }
 
@@ -870,7 +837,7 @@ async function applyAction(action, ctx) {
       return;
     }
 
-       case "CONFIRM_ORDER": {
+    case "CONFIRM_ORDER": {
       const st = await getConversationState(merchant.id, customer.id);
 
       if (!st?.recipient_mode) {
@@ -911,102 +878,95 @@ async function applyAction(action, ctx) {
       }
 
       // self
-      // self
-if (st.recipient_mode === "self") {
-  if (!customer.name) {
-    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
-    ctx.overrideMessage = "D'accord 🙂 Quel est votre nom (et prénom) ?";
-    return;
-  }
+      if (st.recipient_mode === "self") {
+        if (!customer.name) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "name", recipient_mode: "self" });
+          ctx.overrideMessage = "D'accord 🙂 Quel est votre nom (et prénom) ?";
+          return;
+        }
 
-  // ✅ CRÉER LA COMMANDE
-  await createOrderFromCart(merchant.id, customer.id, {
-    recipientCustomerId: customer.id,
-    recipientNameSnapshot: customer.name,
-    recipientPhoneSnapshot: customer.phone || null,
-    recipientAddressSnapshot: customer.address || null,
-    deliveryRequestedAt: deliveryAt,
-    deliveryRequestedRaw: deliveryRaw,
-    status: "NEW",
-  });
+        // ✅ CRÉER LA COMMANDE
+        await createOrderFromCart(merchant.id, customer.id, {
+          recipientCustomerId: customer.id,
+          recipientNameSnapshot: customer.name,
+          recipientPhoneSnapshot: customer.phone || null,
+          recipientAddressSnapshot: customer.address || null,
+          deliveryRequestedAt: deliveryAt,
+          deliveryRequestedRaw: deliveryRaw,
+          status: "NEW",
+        });
 
-  // ✅ VIDER LE PANIER APRÈS CONFIRMATION
-  await clearCart(merchant.id, customer.id);
-
-  // ✅ RESET COMPLET DU STATE
-  await setConversationState(merchant.id, customer.id, {
-    opted_out: false,
-    order_completed: true,
-    step: "COMPLETED",
-    waiting_field: null,
-    loop_guard: null,
-    recipient_mode: null, // ⬅️ RESET pour prochaine commande
-    delivery_requested_raw: null, // ⬅️ RESET
-    pending_add_to_cart: null, // ⬅️ RESET
-  });
-  
-  ctx.overrideMessage = `✅ Commande confirmée. Livraison prévue le ${deliveryAt.toLocaleString("fr-FR")}. Merci et à bientôt !`;
-  return;
-}
+        // ✅ RESET COMPLET DU STATE
+        await setConversationState(merchant.id, customer.id, {
+          opted_out: false,
+          order_completed: true,
+          step: "COMPLETED",
+          waiting_field: null,
+          loop_guard: null,
+          recipient_mode: null, // ⬅️ RESET pour prochaine commande
+          delivery_requested_raw: null, // ⬅️ RESET
+          pending_add_to_cart: null, // ⬅️ RESET
+        });
+        
+        ctx.overrideMessage = `✅ Commande confirmée. Livraison prévue le ${deliveryAt.toLocaleString("fr-FR")}. Merci et à bientôt !`;
+        return;
+      }
 
       // third party
-if (st.recipient_mode === "third_party") {
-  if (!st.recipient_name) {
-    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_name" });
-    ctx.overrideMessage = "Très bien. Donne-moi le *nom et prénom* du destinataire.";
-    return;
-  }
-  if (!st.recipient_phone) {
-    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_phone" });
-    ctx.overrideMessage = "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX).";
-    return;
-  }
-  if (!st.recipient_address) {
-    await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_address" });
-    ctx.overrideMessage = "Merci. Et l'*adresse de livraison* du destinataire ?";
-    return;
-  }
+      if (st.recipient_mode === "third_party") {
+        if (!st.recipient_name) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_name" });
+          ctx.overrideMessage = "Très bien. Donne-moi le *nom et prénom* du destinataire.";
+          return;
+        }
+        if (!st.recipient_phone) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_phone" });
+          ctx.overrideMessage = "Super. Donne-moi son *numéro WhatsApp* (format 225XXXXXXXXXX).";
+          return;
+        }
+        if (!st.recipient_address) {
+          await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_address" });
+          ctx.overrideMessage = "Merci. Et l'*adresse de livraison* du destinataire ?";
+          return;
+        }
 
-  const recipientPhone = normalizeE164(st.recipient_phone);
-  const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
+        const recipientPhone = normalizeE164(st.recipient_phone);
+        const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
 
-  if (recipient && st.recipient_name) 
-    await updateCustomerField(merchant.id, recipient.id, "name", st.recipient_name);
-  if (recipient && st.recipient_address) 
-    await updateCustomerField(merchant.id, recipient.id, "address", st.recipient_address);
+        if (recipient && st.recipient_name) 
+          await updateCustomerField(merchant.id, recipient.id, "name", st.recipient_name);
+        if (recipient && st.recipient_address) 
+          await updateCustomerField(merchant.id, recipient.id, "address", st.recipient_address);
 
-  // ✅ CRÉER LA COMMANDE
-  await createOrderFromCart(merchant.id, customer.id, {
-    recipientCustomerId: recipient?.id || null,
-    recipientNameSnapshot: st.recipient_name,
-    recipientPhoneSnapshot: recipientPhone,
-    recipientAddressSnapshot: st.recipient_address,
-    deliveryRequestedAt: deliveryAt,
-    deliveryRequestedRaw: deliveryRaw,
-    status: "NEW",
-  });
+        // ✅ CRÉER LA COMMANDE
+        await createOrderFromCart(merchant.id, customer.id, {
+          recipientCustomerId: recipient?.id || null,
+          recipientNameSnapshot: st.recipient_name,
+          recipientPhoneSnapshot: recipientPhone,
+          recipientAddressSnapshot: st.recipient_address,
+          deliveryRequestedAt: deliveryAt,
+          deliveryRequestedRaw: deliveryRaw,
+          status: "NEW",
+        });
 
-  // ✅ VIDER LE PANIER APRÈS CONFIRMATION
-  await clearCart(merchant.id, customer.id);
-
-  // ✅ RESET COMPLET DU STATE
-  await setConversationState(merchant.id, customer.id, {
-    opted_out: false,
-    order_completed: true,
-    step: "COMPLETED",
-    waiting_field: null,
-    loop_guard: null,
-    recipient_mode: null, // ⬅️ RESET
-    recipient_name: null, // ⬅️ RESET
-    recipient_phone: null, // ⬅️ RESET
-    recipient_address: null, // ⬅️ RESET
-    delivery_requested_raw: null, // ⬅️ RESET
-    pending_add_to_cart: null, // ⬅️ RESET
-  });
-  
-  ctx.overrideMessage = `✅ Commande confirmée pour ${st.recipient_name}. Livraison le ${deliveryAt.toLocaleString("fr-FR")}. Merci et à bientôt !`;
-  return;
-}
+        // ✅ RESET COMPLET DU STATE
+        await setConversationState(merchant.id, customer.id, {
+          opted_out: false,
+          order_completed: true,
+          step: "COMPLETED",
+          waiting_field: null,
+          loop_guard: null,
+          recipient_mode: null, // ⬅️ RESET
+          recipient_name: null, // ⬅️ RESET
+          recipient_phone: null, // ⬅️ RESET
+          recipient_address: null, // ⬅️ RESET
+          delivery_requested_raw: null, // ⬅️ RESET
+          pending_add_to_cart: null, // ⬅️ RESET
+        });
+        
+        ctx.overrideMessage = `✅ Commande confirmée pour ${st.recipient_name}. Livraison le ${deliveryAt.toLocaleString("fr-FR")}. Merci et à bientôt !`;
+        return;
+      }
 
       await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
       ctx.overrideMessage = "Parfait ✅ C'est pour vous-même (1) ou pour une autre personne (2) ?";
@@ -1018,8 +978,6 @@ if (st.recipient_mode === "third_party") {
       return;
   }
 }
-
-
 
 // ================================
 // Moteur commun (utilisé par WAHA + Postman)
@@ -1180,6 +1138,43 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 
   return { message: outgoingMsg || null, actions };
 }
+
+// ================================
+// Route pour upload logo
+// ================================
+app.post(
+  '/api/merchants/:merchantId/logo',
+  authMiddleware,
+  requireSameMerchant,
+  uploadLogo.single('logo'),
+  async (req, res) => {
+    try {
+      const merchantId = Number(req.params.merchantId);
+      const logoUrl = `https://92.112.193.171/uploads/logos/${req.file.filename}`;
+      
+      // Mettre à jour en base
+      const result = await query(
+        'UPDATE merchants SET logo_url = $1 WHERE id = $2 RETURNING id, name, logo_url',
+        [logoUrl, merchantId]
+      );
+      
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: 'Marchand introuvable' });
+      }
+      
+      return res.json({ 
+        success: true, 
+        logo_url: logoUrl,
+        merchant: result.rows[0]
+      });
+      
+    } catch (error) {
+      console.error('Erreur upload logo:', error);
+      return res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
 // ================================
 // Webhook "test" (Postman)
 // ================================
