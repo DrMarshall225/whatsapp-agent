@@ -40,7 +40,7 @@ if (merchant.logo_url) {
     });
     
     // Espace après le logo
-    doc.moveDown(8);
+    doc.moveDown(15);
     
   } catch (err) {
     console.warn(`[PDF] Logo non chargé:`, err.message);
