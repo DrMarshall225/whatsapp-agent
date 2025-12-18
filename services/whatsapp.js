@@ -283,7 +283,7 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
     fs.copyFileSync(filePath, publicPath);
     
     // ✅ URL publique du fichier
-    const fileUrl = `https://92.112.193.171/uploads/catalogs/${publicFilename}`;
+    const fileUrl = `https://srv853938.hstgr.cloud/uploads/catalogs/${publicFilename}`;
     
     console.log('[WAHA] Envoi document via URL:', { 
       session: sessionName, 
