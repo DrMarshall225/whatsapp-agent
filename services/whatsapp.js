@@ -273,61 +273,62 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
       throw new Error(`Fichier introuvable: ${filePath}`);
     }
 
-    // ✅ Lire le fichier en base64
-    const fileBuffer = fs.readFileSync(filePath);
-    const fileBase64 = fileBuffer.toString('base64');
-    
-    // ✅ Essayer plusieurs endpoints possibles
-    const endpoints = [
-      `/api/${sessionName}/sendFile`,
-      `/api/sendFile/${sessionName}`,
-      `/api/${sessionName}/sendDocument`,
-      `/api/${sessionName}/sendMedia`
-    ];
-
-    for (const endpoint of endpoints) {
-      const url = `${wahaUrl}${endpoint}`;
-      
-      console.log(`[WAHA] Tentative envoi document: ${url}`);
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          chatId: chatId,
-          file: {
-            mimetype: 'application/pdf',
-            filename: filename,
-            data: fileBase64
-          },
-          caption: caption || ''
-        })
-      });
-
-      const status = response.status;
-      
-      if (status !== 404) {
-        // Cet endpoint existe !
-        const ok = response.ok;
-        const data = await response.json().catch(() => ({}));
-        
-        console.log('[WAHA] Document envoyé:', { 
-          endpoint,
-          session: sessionName, 
-          chatId, 
-          filename,
-          status, 
-          ok,
-          response: JSON.stringify(data).substring(0, 200)
-        });
-
-        return { ok, status, data };
-      }
+    // ✅ Copier le fichier dans un dossier accessible via HTTP
+    const publicDir = '/var/www/uploads/catalogs';
+    if (!fs.existsSync(publicDir)) {
+      fs.mkdirSync(publicDir, { recursive: true });
     }
+    
+    const publicFilename = `catalog_${merchant.id}_${Date.now()}.pdf`;
+    const publicPath = `${publicDir}/${publicFilename}`;
+    fs.copyFileSync(filePath, publicPath);
+    
+    // ✅ URL publique du fichier
+    const fileUrl = `https://92.112.193.171/uploads/catalogs/${publicFilename}`;
+    
+    console.log('[WAHA] Envoi document via URL:', { 
+      session: sessionName, 
+      chatId, 
+      filename,
+      fileUrl
+    });
 
-    throw new Error('Aucun endpoint valide trouvé pour envoyer des fichiers');
+    // ✅ Essayer avec sendText + lien (fallback simple)
+    const url = `${wahaUrl}/api/sendText`;
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        session: sessionName,
+        chatId: chatId,
+        text: `📄 *${filename}*\n\n${caption}\n\n🔗 Télécharger : ${fileUrl}`
+      })
+    });
+
+    const ok = response.ok;
+    const status = response.status;
+    const data = await response.json().catch(() => ({}));
+
+    console.log('[WAHA] Document envoyé:', { 
+      session: sessionName, 
+      chatId, 
+      filename,
+      status, 
+      ok
+    });
+
+    // ✅ Nettoyer le fichier public après 1 minute
+    setTimeout(() => {
+      if (fs.existsSync(publicPath)) {
+        fs.unlinkSync(publicPath);
+        console.log(`[PDF] 🗑️ Fichier public nettoyé: ${publicPath}`);
+      }
+    }, 60000);
+
+    return { ok, status, data };
 
   } catch (error) {
     console.error('[WAHA] Erreur envoi document:', error);
