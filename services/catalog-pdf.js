@@ -44,6 +44,9 @@ export async function generateCatalogPDF(merchant, products) {
             fit: [80, 80]
           });
           currentY += 90;
+          // Espace après le logo
+         doc.moveDown(8);
+         
         } catch (err) {
           console.warn(`[PDF] Logo non chargé:`, err.message);
         }
