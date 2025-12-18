@@ -256,12 +256,6 @@ export async function sendWhatsappImage({ merchant, chatId, to, imageUrl, captio
 }
 
 /**
- * ✅ NOUVEAU: Envoi de document via WAHA
- */
-/**
- * Envoie un document (PDF, image, etc.) via WhatsApp
- */
-/**
  * Envoie un document (PDF, image, etc.) via WhatsApp
  */
 export async function sendWhatsappDocument({ merchant, chatId, to, filePath, filename, caption = '' }) {
@@ -285,10 +279,9 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
     
     form.append('chatId', chatId);
     form.append('file', fs.createReadStream(filePath), { filename });
-    form.append('session', sessionName); // ✅ Ajouter le session dans le body
     if (caption) form.append('caption', caption);
 
-    // ✅ Utiliser l'endpoint sans le session name dans l'URL
+    // ✅ CORRECTION : Utiliser le bon endpoint WAHA
     const url = `${wahaUrl}/api/sendFile`;
     
     console.log('[WAHA] Envoi document:', { 
@@ -301,7 +294,10 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
     const response = await fetch(url, {
       method: 'POST',
       body: form,
-      headers: form.getHeaders()
+      headers: {
+        ...form.getHeaders(),
+        'X-Api-Key': sessionName // ✅ WAHA utilise le session name comme API key
+      }
     });
 
     const ok = response.ok;
