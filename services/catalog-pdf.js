@@ -70,7 +70,7 @@ if (merchant.logo_url) {
       // ===== GRILLE DE PRODUITS (2 colonnes) =====
       const itemsPerPage = 6; // 2 colonnes x 3 lignes
       const pageWidth = doc.page.width - 60; // marges
-      const colWidth = pageWidth / 2 - 10;
+      const colWidth = Math.floor(pageWidth / 2 - 10);
       const imageHeight = 120;
       
       for (let i = 0; i < products.length; i++) {
@@ -93,11 +93,11 @@ if (merchant.logo_url) {
             // Télécharger et redimensionner l'image
             const imageBuffer = await downloadAndResizeImage(product.image_url, colWidth, imageHeight);
             doc.image(imageBuffer, x, y, { 
-              width: colWidth, 
-              height: imageHeight,
-              fit: [colWidth, imageHeight],
-              align: 'center'
-            });
+  width: Math.floor(colWidth),  // ✅ AJOUTER Math.floor()
+  height: Math.floor(imageHeight), // ✅ AJOUTER Math.floor()
+  fit: [Math.floor(colWidth), Math.floor(imageHeight)],
+  align: 'center'
+});
           } catch (err) {
             console.warn(`Image failed for product ${product.id}:`, err.message);
             // Placeholder si image échoue

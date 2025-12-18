@@ -254,36 +254,66 @@ export async function sendWhatsappImage({ merchant, chatId, to, imageUrl, captio
 /**
  * ✅ NOUVEAU: Envoi de document via WAHA
  */
-export async function sendWhatsappDocument({ merchant, chatId, to, documentUrl, filename, caption = "" }) {
-  const session = merchant?.waha_session;
+/**
+ * Envoie un document (PDF, image, etc.) via WhatsApp
+ */
+export async function sendWhatsappDocument({ merchant, chatId, to, filePath, filename, caption = '' }) {
+  const wahaUrl = process.env.WAHA_URL || 'http://localhost:3000';
+  const sessionName = merchant.waha_session;
 
-  if (!session) {
-    throw new Error("merchant.waha_session manquant");
-  }
-  
-  if (!documentUrl) {
-    throw new Error("documentUrl vide");
-  }
-
-  const finalChatId = normalizeChatId(chatId) || normalizeChatId(to);
-  
-  if (!finalChatId) {
-    throw new Error("Missing chatId/to");
+  if (!sessionName) {
+    console.warn('[WAHA] Pas de waha_session configurée pour ce marchand');
+    return null;
   }
 
-  const payload = {
-    session,
-    chatId: finalChatId,
-    file: {
-      url: documentUrl,
-      filename: filename || "document.pdf",
-    },
-    caption: caption || "",
-  };
+  try {
+    // ✅ Vérifier que le fichier existe
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new Error(`Fichier introuvable: ${filePath}`);
+    }
 
-  return sendWahaMessage("/api/sendFile", payload, WAHA_CONFIG.timeout.media);
+    // ✅ Créer FormData pour upload
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    
+    form.append('chatId', chatId);
+    form.append('file', fs.createReadStream(filePath), { filename });
+    if (caption) form.append('caption', caption);
+
+    const url = `${wahaUrl}/api/${sessionName}/sendFile`;
+    
+    console.log('[WAHA] Envoi document:', { 
+      session: sessionName, 
+      chatId, 
+      filename,
+      url 
+    });
+
+    const response = await fetch(url, {
+      method: 'POST',
+      body: form,
+      headers: form.getHeaders()
+    });
+
+    const ok = response.ok;
+    const status = response.status;
+    const data = await response.json().catch(() => ({}));
+
+    console.log('[WAHA] Document envoyé:', { 
+      session: sessionName, 
+      chatId, 
+      filename,
+      status, 
+      ok 
+    });
+
+    return { ok, status, data };
+
+  } catch (error) {
+    console.error('[WAHA] Erreur envoi document:', error);
+    throw error;
+  }
 }
-
 /**
  * ✅ NOUVEAU: Health check WAHA
  */
