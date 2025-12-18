@@ -272,7 +272,62 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
       throw new Error(`Fichier introuvable: ${filePath}`);
     }
 
-    // ✅ Copier le fichier dans un dossier accessible via HTTP
+    // ✅ Lire le fichier en base64
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileBase64 = fileBuffer.toString('base64');
+    
+    console.log('[WAHA] Envoi document en base64:', { 
+      session: sessionName, 
+      chatId, 
+      filename,
+      fileSize: fileBuffer.length
+    });
+
+    // ✅ Normaliser le chatId
+    const finalChatId = normalizeChatId(chatId) || normalizeChatId(to);
+    
+    if (!finalChatId) {
+      throw new Error("Missing chatId/to");
+    }
+
+    // ✅ Essayer d'envoyer directement avec WAHA
+    const payload = {
+      session: sessionName,
+      chatId: finalChatId,
+      file: {
+        mimetype: 'application/pdf',
+        filename: filename,
+        data: fileBase64
+      },
+      caption: caption || ''
+    };
+
+    // Essayer différents endpoints
+    const endpoints = [
+      '/api/sendFile',
+      '/api/files/sendFile'
+    ];
+
+    for (const endpoint of endpoints) {
+      try {
+        const result = await sendWahaMessage(endpoint, payload, 30000);
+        
+        console.log('[WAHA] Document envoyé via', endpoint, ':', { 
+          session: sessionName, 
+          chatId: finalChatId, 
+          filename
+        });
+
+        return result;
+      } catch (error) {
+        console.log(`[WAHA] ${endpoint} failed, trying next...`);
+        continue;
+      }
+    }
+
+    // Si tous les endpoints échouent, fallback sur HTTP link
+    console.log('[WAHA] Fallback: envoi via lien HTTP');
+    
     const publicDir = '/var/www/uploads/catalogs';
     if (!fs.existsSync(publicDir)) {
       fs.mkdirSync(publicDir, { recursive: true });
@@ -282,40 +337,18 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
     const publicPath = `${publicDir}/${publicFilename}`;
     fs.copyFileSync(filePath, publicPath);
     
-    // ✅ URL publique du fichier
-    const fileUrl = `http://srv853938.hstgr.cloud/uploads/catalogs/${publicFilename}`;
+    // ✅ Utiliser HTTP au lieu de HTTPS
+    const fileUrl = `http://92.112.193.171/uploads/catalogs/${publicFilename}`;
     
-    console.log('[WAHA] Envoi document via URL:', { 
-      session: sessionName, 
-      chatId, 
-      filename,
-      fileUrl
-    });
-
-    // ✅ Normaliser le chatId (comme dans sendWhatsappMessage)
-    const finalChatId = normalizeChatId(chatId) || normalizeChatId(to);
-    
-    if (!finalChatId) {
-      throw new Error("Missing chatId/to");
-    }
-
-    // ✅ UTILISER LA MÊME FONCTION HELPER
-    const payload = {
+    const textPayload = {
       session: sessionName,
       chatId: finalChatId,
       text: `📄 *${filename}*\n\n${caption}\n\n🔗 Télécharger : ${fileUrl}`
     };
 
-    const result = await sendWahaMessage("/api/sendText", payload, 10000);
+    const result = await sendWahaMessage("/api/sendText", textPayload, 10000);
 
-    console.log('[WAHA] Document envoyé:', { 
-      session: sessionName, 
-      chatId: finalChatId, 
-      filename,
-      result
-    });
-
-    // ✅ Nettoyer le fichier public après 5 minutes
+    // Nettoyer après 5 minutes
     setTimeout(() => {
       if (fs.existsSync(publicPath)) {
         fs.unlinkSync(publicPath);
