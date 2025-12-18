@@ -51,6 +51,72 @@ import {
 import { callCommandBot } from "./services/commandbot.js";
 import { sendWhatsappMessage } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
+import { generateCatalogPDF, cleanupPDF } from './services/catalog-pdf.js';
+
+import multer from 'multer';
+import path from 'path';
+
+// Servir les fichiers uploads (logos, etc.)
+app.use('/uploads', express.static('/var/www/uploads'));
+
+// Configuration Multer pour upload de logos
+const logoStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, '/var/www/uploads/logos/'); // Créer ce dossier
+  },
+  filename: (req, file, cb) => {
+    const merchantId = req.params.merchantId;
+    const ext = path.extname(file.originalname);
+    cb(null, `merchant_${merchantId}_logo${ext}`);
+  }
+});
+
+const uploadLogo = multer({
+  storage: logoStorage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB max
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Type de fichier non autorisé. PNG, JPG uniquement.'));
+    }
+  }
+});
+
+// Route pour upload logo
+app.post(
+  '/api/merchants/:merchantId/logo',
+  authMiddleware,
+  requireSameMerchant,
+  uploadLogo.single('logo'),
+  async (req, res) => {
+    try {
+      const merchantId = Number(req.params.merchantId);
+      const logoUrl = `https://92.112.193.171/uploads/logos/${req.file.filename}`;
+      
+      // Mettre à jour en base
+      const result = await query(
+        'UPDATE merchants SET logo_url = $1 WHERE id = $2 RETURNING id, name, logo_url',
+        [logoUrl, merchantId]
+      );
+      
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: 'Marchand introuvable' });
+      }
+      
+      return res.json({ 
+        success: true, 
+        logo_url: logoUrl,
+        merchant: result.rows[0]
+      });
+      
+    } catch (error) {
+      console.error('Erreur upload logo:', error);
+      return res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
 
 // ================================
 // Config
@@ -962,8 +1028,6 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const customer = await findOrCreateCustomer(merchant.id, from);
   const conversationState = await getConversationState(merchant.id, customer.id);
 
-  
-
   // ✅ silence si opt-out déjà activé (sauf réactivation)
   if (conversationState?.opted_out && !isReactivationMessage(text)) {
     return { message: null, actions: [] };
@@ -983,10 +1047,73 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
     return { message: structured.message || null, actions: [] };
   }
 
-  // ✅ CORRECTION CRITIQUE : Récupérer le panier de la DB
+  // ===== NOUVEAU : DÉTECTION "AVEC IMAGES" POUR PDF =====
+  const normalizedText = text.toLowerCase().trim();
+  const isPdfRequest = 
+    normalizedText.includes("avec images") ||
+    normalizedText.includes("avec photos") ||
+    normalizedText.includes("catalogue pdf") ||
+    normalizedText === "pdf" ||
+    normalizedText === "images";
+
+  if (isPdfRequest) {
+    try {
+      // Récupérer les produits
+      const products = await getProductsForMerchant(merchant.id);
+      
+      if (products.length === 0) {
+        await sendWhatsappMessage({
+          merchant,
+          chatId: replyChatId,
+          to: from,
+          text: "Désolé, aucun produit n'est disponible pour le moment.",
+        });
+        return { message: "Aucun produit disponible", actions: [] };
+      }
+
+      // Message de chargement
+      await sendWhatsappMessage({
+        merchant,
+        chatId: replyChatId,
+        to: from,
+        text: "🔄 Génération du catalogue PDF en cours (quelques secondes)..."
+      });
+
+      // Générer le PDF
+      console.log(`[Catalog] 📄 Génération PDF pour ${products.length} produits...`);
+      const pdfPath = await generateCatalogPDF(merchant, products);
+
+      // Envoyer le PDF via WhatsApp
+      await sendWhatsappDocument({
+        merchant,
+        chatId: replyChatId,
+        to: from,
+        filePath: pdfPath,
+        filename: `Catalogue_${merchant.name.replace(/\s+/g, '_')}.pdf`,
+        caption: `📦 Catalogue complet (${products.length} produits)\n\n✅ Pour commander, tapez le nom ou le code du produit`
+      });
+
+      // Nettoyer le fichier après envoi (attendre 10 secondes)
+      setTimeout(() => cleanupPDF(pdfPath), 10000);
+
+      return { message: "Catalogue PDF envoyé", actions: [] };
+      
+    } catch (error) {
+      console.error('[Catalog] ❌ Erreur génération PDF:', error);
+      await sendWhatsappMessage({
+        merchant,
+        chatId: replyChatId,
+        to: from,
+        text: "❌ Erreur lors de la génération du catalogue. Veuillez réessayer ou tapez 1 pour voir la liste."
+      });
+      return { message: "Erreur PDF", actions: [] };
+    }
+  }
+
+  // ✅ RÉCUPÉRER LE PANIER DE LA DB
   const cart = await getCart(merchant.id, customer.id);
 
-  // ✅ LOG DE DIAGNOSTIC AJOUTÉ
+  // ✅ LOG DE DIAGNOSTIC
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("🛒 CART DEBUG (from getCart):");
   console.log("  Type:", Array.isArray(cart) ? "Array" : typeof cart);
@@ -999,7 +1126,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   } else if (cart?.items && cart.items.length > 0) {
     console.log("  Items:");
     cart.items.forEach(item => {
-      console.log(`    - ${item.name} x${item.quantity} (${item.total || item.price * item.quantity} XOF)`);
+      console.log(`    - ${item.name} x${item.quantity} (${item.total_price || item.total || item.price * item.quantity} XOF)`);
     });
   } else {
     console.log("  ⚠️ Panier vide ou format inconnu");
@@ -1053,7 +1180,6 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 
   return { message: outgoingMsg || null, actions };
 }
-
 // ================================
 // Webhook "test" (Postman)
 // ================================
