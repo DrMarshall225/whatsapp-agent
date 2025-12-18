@@ -36,14 +36,14 @@ export async function generateCatalogPDF(merchant, products) {
       // LOGO DU MARCHAND (si disponible)
       if (merchant.logo_url) {
         try {
-          const logoBuffer = await downloadAndResizeImage(merchant.logo_url, 100, 100);
-          const logoX = (doc.page.width - 100) / 2;
+          const logoBuffer = await downloadAndResizeImage(merchant.logo_url, 80, 80);
+          const logoX = (doc.page.width - 80) / 2;
           doc.image(logoBuffer, logoX, currentY, { 
-            width: 100,
-            height: 100,
-            fit: [100, 100]
+            width: 80,
+            height: 80,
+            fit: [80, 80]
           });
-          currentY += 110;
+          currentY += 90;
         } catch (err) {
           console.warn(`[PDF] Logo non chargé:`, err.message);
         }
@@ -51,28 +51,28 @@ export async function generateCatalogPDF(merchant, products) {
       
       // NOM DE LA BOUTIQUE
       doc
-        .fontSize(24)
+        .fontSize(22)
         .font('Helvetica-Bold')
         .fillColor('#000000')
         .text(merchant.name || 'CATALOGUE', { align: 'center' });
       currentY += 30;
       
-      // COORDONNÉES
-      doc.fontSize(11).font('Helvetica').fillColor('#333333');
+      // COORDONNÉES (sans emojis, juste texte)
+      doc.fontSize(10).font('Helvetica').fillColor('#333333');
       
       if (merchant.phone || merchant.whatsapp_number) {
         const phone = merchant.phone || merchant.whatsapp_number;
-        doc.text(`📱 ${phone}`, { align: 'center' });
+        doc.text(`Tel: ${phone}`, { align: 'center' });
         currentY += 15;
       }
       
       if (merchant.email) {
-        doc.text(`📧 ${merchant.email}`, { align: 'center' });
+        doc.text(`Email: ${merchant.email}`, { align: 'center' });
         currentY += 15;
       }
       
       if (merchant.address) {
-        doc.text(`📍 ${merchant.address}`, { align: 'center' });
+        doc.text(`Adresse: ${merchant.address}`, { align: 'center' });
         currentY += 15;
       }
       
@@ -81,18 +81,18 @@ export async function generateCatalogPDF(merchant, products) {
         .fontSize(9)
         .fillColor('#999999')
         .text(new Date().toLocaleDateString('fr-FR'), { align: 'center' });
-      currentY += 30;
+      currentY += 35;
       
       // ===== 4 PREMIERS PRODUITS (2x2) =====
       const firstPageProducts = products.slice(0, 4);
       
       for (let i = 0; i < firstPageProducts.length; i++) {
         const product = firstPageProducts[i];
-        const col = i % 2; // 0 = gauche, 1 = droite
-        const row = Math.floor(i / 2); // 0 ou 1
+        const col = i % 2;
+        const row = Math.floor(i / 2);
         
         const x = 30 + (col * (colWidth + 20));
-        const y = currentY + (row * 200);
+        const y = currentY + (row * 210); // Augmenté l'espacement
         
         await renderProduct(doc, product, x, y, colWidth, imageHeight);
       }
@@ -105,15 +105,15 @@ export async function generateCatalogPDF(merchant, products) {
         const product = remainingProducts[i];
         
         // Nouvelle page tous les 6 produits
-        if (i > 0 && i % itemsPerPage === 0) {
+        if (i % itemsPerPage === 0) {
           doc.addPage();
         }
         
-        const col = i % 2; // 0 = gauche, 1 = droite
-        const row = Math.floor((i % itemsPerPage) / 2); // 0, 1, ou 2
+        const col = i % 2;
+        const row = Math.floor((i % itemsPerPage) / 2);
         
         const x = 30 + (col * (colWidth + 20));
-        const y = 50 + (row * 200);
+        const y = 50 + (row * 210); // Augmenté l'espacement
         
         await renderProduct(doc, product, x, y, colWidth, imageHeight);
       }
@@ -169,56 +169,66 @@ async function renderProduct(doc, product, x, y, colWidth, imageHeight) {
       console.warn(`[PDF] Image failed for product ${product.id}:`, err.message);
       // Placeholder si image échoue
       doc
+        .save()
         .rect(x, y, colWidth, imageHeight)
-        .stroke()
-        .fontSize(10)
-        .fillColor('#666666')
-        .text('Image indisponible', x, y + imageHeight/2, { width: colWidth, align: 'center' });
+        .fillAndStroke('#f5f5f5', '#cccccc')
+        .restore()
+        .fontSize(9)
+        .fillColor('#999999')
+        .text('Image indisponible', x, y + imageHeight/2 - 5, { 
+          width: colWidth, 
+          align: 'center' 
+        });
     }
   } else {
     // Placeholder si pas d'image
     doc
+      .save()
       .rect(x, y, colWidth, imageHeight)
-      .fillAndStroke('#f0f0f0', '#cccccc')
-      .fontSize(10)
-      .fillColor('#666666')
-      .text('Pas d\'image', x, y + imageHeight/2, { width: colWidth, align: 'center' });
+      .fillAndStroke('#f5f5f5', '#cccccc')
+      .restore()
+      .fontSize(9)
+      .fillColor('#999999')
+      .text('Pas d\'image', x, y + imageHeight/2 - 5, { 
+        width: colWidth, 
+        align: 'center' 
+      });
   }
   
   // ===== NOM DU PRODUIT =====
   doc
-    .fontSize(11)
+    .fontSize(10)
     .font('Helvetica-Bold')
     .fillColor('#000000')
     .text(
       product.name.toUpperCase(),
       x,
-      y + imageHeight + 5,
-      { width: colWidth, align: 'center' }
+      y + imageHeight + 8,
+      { width: colWidth, align: 'center', lineGap: 2 }
     );
   
   // ===== PRIX =====
   doc
-    .fontSize(14)
+    .fontSize(13)
     .font('Helvetica-Bold')
     .fillColor('#27ae60')
     .text(
       `${product.price} ${product.currency || 'XOF'}`,
       x,
-      y + imageHeight + 25,
+      y + imageHeight + 30,
       { width: colWidth, align: 'center' }
     );
   
   // ===== CODE =====
   if (product.code) {
     doc
-      .fontSize(9)
+      .fontSize(8)
       .font('Helvetica')
       .fillColor('#666666')
       .text(
         `Code: ${product.code}`,
         x,
-        y + imageHeight + 45,
+        y + imageHeight + 48,
         { width: colWidth, align: 'center' }
       );
   }
@@ -236,7 +246,7 @@ async function downloadAndResizeImage(url, maxWidth, maxHeight) {
     });
     
     const resizedBuffer = await sharp(response.data)
-      .resize(maxWidth, maxHeight, {
+      .resize(Math.floor(maxWidth), Math.floor(maxHeight), {
         fit: 'inside',
         withoutEnlargement: true
       })
