@@ -277,51 +277,57 @@ export async function sendWhatsappDocument({ merchant, chatId, to, filePath, fil
     const fileBuffer = fs.readFileSync(filePath);
     const fileBase64 = fileBuffer.toString('base64');
     
-    // ✅ Détecter le mimetype
-    const mimeType = filename.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream';
+    // ✅ Essayer plusieurs endpoints possibles
+    const endpoints = [
+      `/api/${sessionName}/sendFile`,
+      `/api/sendFile/${sessionName}`,
+      `/api/${sessionName}/sendDocument`,
+      `/api/${sessionName}/sendMedia`
+    ];
 
-    // ✅ MÊME FORMAT QUE sendText : /api/{session}/sendFile
-    const url = `${wahaUrl}/api/${sessionName}/sendFile`;
-    
-    console.log('[WAHA] Envoi document:', { 
-      session: sessionName, 
-      chatId, 
-      filename,
-      url,
-      fileSize: fileBuffer.length
-    });
+    for (const endpoint of endpoints) {
+      const url = `${wahaUrl}${endpoint}`;
+      
+      console.log(`[WAHA] Tentative envoi document: ${url}`);
 
-    // ✅ Envoyer en JSON (comme sendText)
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        chatId: chatId,
-        file: {
-          mimetype: mimeType,
-          filename: filename,
-          data: fileBase64
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-        caption: caption || undefined
-      })
-    });
+        body: JSON.stringify({
+          chatId: chatId,
+          file: {
+            mimetype: 'application/pdf',
+            filename: filename,
+            data: fileBase64
+          },
+          caption: caption || ''
+        })
+      });
 
-    const ok = response.ok;
-    const status = response.status;
-    const data = await response.json().catch(() => ({}));
+      const status = response.status;
+      
+      if (status !== 404) {
+        // Cet endpoint existe !
+        const ok = response.ok;
+        const data = await response.json().catch(() => ({}));
+        
+        console.log('[WAHA] Document envoyé:', { 
+          endpoint,
+          session: sessionName, 
+          chatId, 
+          filename,
+          status, 
+          ok,
+          response: JSON.stringify(data).substring(0, 200)
+        });
 
-    console.log('[WAHA] Document envoyé:', { 
-      session: sessionName, 
-      chatId, 
-      filename,
-      status, 
-      ok,
-      response: JSON.stringify(data).substring(0, 200)
-    });
+        return { ok, status, data };
+      }
+    }
 
-    return { ok, status, data };
+    throw new Error('Aucun endpoint valide trouvé pour envoyer des fichiers');
 
   } catch (error) {
     console.error('[WAHA] Erreur envoi document:', error);
