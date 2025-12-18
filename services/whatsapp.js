@@ -15,11 +15,13 @@ const WAHA_CONFIG = {
   retries: Number(process.env.WAHA_RETRIES) || 2,              // 2 retries par défaut
 };
 
+
 // Validation au démarrage
 if (WAHA_CONFIG.baseUrl && !WAHA_CONFIG.apiKey) {
   console.warn("[WAHA] ⚠️ WAHA_BASE_URL configuré mais WAHA_API_KEY manquant");
 }
 
+import fs from 'fs';
 /**
  * ✅ CORRECTION #3: Normalisation chatId avec validation
  */
@@ -186,6 +188,8 @@ async function sendWahaMessage(endpoint, payload, timeoutMs = WAHA_CONFIG.timeou
  * @param {string} [params.to]      - fallback numéro (ex: +22507...)
  * @param {string} params.text      - message à envoyer
  */
+
+
 export async function sendWhatsappMessage({ merchant, chatId, to, text }) {
   const session = merchant?.waha_session;
 
