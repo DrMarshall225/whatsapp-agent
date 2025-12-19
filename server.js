@@ -1113,7 +1113,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 }
 
 // ================================
-// Route pour upload logo
+// Configuration Upload (Images produits + Logos)
 // ================================
 
 // ===== DOSSIERS UPLOAD =====
@@ -1175,6 +1175,9 @@ const uploadLogo = multer({
   }
 });
 
+// ===== SERVIR LES FICHIERS STATIQUES =====
+app.use('/uploads', express.static('/var/www/uploads'));
+
 // ===== ROUTES UPLOAD =====
 
 // Upload image produit
@@ -1219,8 +1222,8 @@ app.post(
 
       const logoUrl = `http://92.112.193.171:3002/uploads/logos/${req.file.filename}`;
       
-      // Mettre à jour en BDD
-      const result = await db.query(
+      // ✅ CORRECTION : Utiliser query() au lieu de db.query()
+      const result = await query(
         'UPDATE merchants SET logo_url = $1 WHERE id = $2 RETURNING *',
         [logoUrl, req.params.merchantId]
       );
@@ -1242,9 +1245,6 @@ app.post(
     }
   }
 );
-
-// ===== SERVIR LES FICHIERS STATIQUES =====
-app.use('/uploads', express.static('/var/www/uploads'));
 
 // ================================
 // Webhook "test" (Postman)
