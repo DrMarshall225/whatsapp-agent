@@ -3,10 +3,11 @@ import express from "express";
 import bodyParser from "body-parser";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
+import multer from 'multer';
+import path from 'path';
 import fs from 'fs';
 
 import {
-  // WhatsApp / bot core
   findMerchantByWahaSession,
   findMerchantByWhatsappNumber,
   findOrCreateCustomer,
@@ -23,20 +24,14 @@ import {
   getLastOrderWithItemsForCustomer,
   cancelLastOrderForCustomer,
   loadLastOrderToCart,
-
-  // Backoffice merchant
   createProductForMerchant,
   updateProductForMerchant,
   deleteProductForMerchant,
   getOrdersForMerchant,
   getOrderWithItems,
   updateOrderStatus,
-
-  // Auth merchant
   findMerchantByEmail,
   createMerchant,
-
-  // Admin
   createMerchantWithWaha,
   updateMerchantWahaConfig,
   adminListMerchants,
@@ -44,18 +39,15 @@ import {
   adminGetDashboard,
   adminAddSubscriptionPayment,
   adminListSubscriptionPayments,
-
-  // Subscription gate
   getMerchantAccessFlags,
 } from "./services/store.pg.js";
 
-import { query } from "./db.js";
 import { callCommandBot } from "./services/commandbot.js";
 import { sendWhatsappMessage, sendWhatsappDocument } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 import { generateCatalogPDF, cleanupPDF } from './services/catalog-pdf.js';
-import multer from 'multer';
-import path from 'path';
+import { query } from "./db.js"; // ✅ CETTE LIGNE EST ESSENTIELLE
+
 
 // ================================
 // Config
