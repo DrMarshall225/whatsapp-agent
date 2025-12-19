@@ -49,12 +49,11 @@ import {
   getMerchantAccessFlags,
 } from "./services/store.pg.js";
 
+import { query } from "./db.js";
 import { callCommandBot } from "./services/commandbot.js";
 import { sendWhatsappMessage, sendWhatsappDocument } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 import { generateCatalogPDF, cleanupPDF } from './services/catalog-pdf.js';
-import { query as db } from "./db.js";
-
 import multer from 'multer';
 import path from 'path';
 
