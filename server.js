@@ -3,6 +3,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
+import fs from 'fs';
 
 import {
   // WhatsApp / bot core
@@ -52,7 +53,7 @@ import { callCommandBot } from "./services/commandbot.js";
 import { sendWhatsappMessage, sendWhatsappDocument } from "./services/whatsapp.js";
 import { PORT } from "./config.js";
 import { generateCatalogPDF, cleanupPDF } from './services/catalog-pdf.js';
-import { query } from "./db.js";
+import { query as db } from "./db.js";
 
 import multer from 'multer';
 import path from 'path';
@@ -69,34 +70,6 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
 // Admin credentials (prod conseillé)
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // ex: admin@dido.com
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt hash
-
-// Servir les fichiers uploads (logos, etc.)
-app.use('/uploads', express.static('/var/www/uploads'));
-
-// Configuration Multer pour upload de logos
-const logoStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, '/var/www/uploads/logos/'); // Créer ce dossier
-  },
-  filename: (req, file, cb) => {
-    const merchantId = req.params.merchantId;
-    const ext = path.extname(file.originalname);
-    cb(null, `merchant_${merchantId}_logo${ext}`);
-  }
-});
-
-const uploadLogo = multer({
-  storage: logoStorage,
-  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB max
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg'];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Type de fichier non autorisé. PNG, JPG uniquement.'));
-    }
-  }
-});
 
 // ================================
 // Helpers (Validation & Anti-ACK)
@@ -1142,6 +1115,97 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 // ================================
 // Route pour upload logo
 // ================================
+
+// ===== DOSSIERS UPLOAD =====
+const productsUploadDir = '/var/www/uploads/products';
+const logosUploadDir = '/var/www/uploads/logos';
+
+if (!fs.existsSync(productsUploadDir)) {
+  fs.mkdirSync(productsUploadDir, { recursive: true });
+}
+if (!fs.existsSync(logosUploadDir)) {
+  fs.mkdirSync(logosUploadDir, { recursive: true });
+}
+
+// ===== MULTER CONFIG IMAGES PRODUITS =====
+const productImageStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, productsUploadDir),
+  filename: (req, file, cb) => {
+    const merchantId = req.params.merchantId;
+    const ext = path.extname(file.originalname);
+    const timestamp = Date.now();
+    cb(null, `product_${merchantId}_${timestamp}${ext}`);
+  }
+});
+
+const uploadProductImage = multer({
+  storage: productImageStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Format invalide. PNG, JPG, WEBP uniquement.'));
+    }
+  }
+});
+
+// ===== MULTER CONFIG LOGOS MARCHANDS =====
+const logoStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, logosUploadDir),
+  filename: (req, file, cb) => {
+    const merchantId = req.params.merchantId;
+    const ext = path.extname(file.originalname);
+    const timestamp = Date.now();
+    cb(null, `logo_${merchantId}_${timestamp}${ext}`);
+  }
+});
+
+const uploadLogo = multer({
+  storage: logoStorage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/png', 'image/jpeg', 'image/jpg'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Format invalide. PNG, JPG uniquement.'));
+    }
+  }
+});
+
+// ===== ROUTES UPLOAD =====
+
+// Upload image produit
+app.post(
+  '/api/merchants/:merchantId/upload-product-image',
+  authMiddleware,
+  requireSameMerchant,
+  uploadProductImage.single('image'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Aucun fichier uploadé' });
+      }
+
+      const imageUrl = `http://92.112.193.171:3002/uploads/products/${req.file.filename}`;
+      
+      console.log('[UPLOAD] Image produit:', {
+        merchant: req.params.merchantId,
+        filename: req.file.filename,
+        url: imageUrl
+      });
+
+      return res.json({ success: true, url: imageUrl, filename: req.file.filename });
+    } catch (error) {
+      console.error('[UPLOAD] Erreur:', error);
+      return res.status(500).json({ error: error.message });
+    }
+  }
+);
+
+// Upload logo marchand
 app.post(
   '/api/merchants/:merchantId/logo',
   authMiddleware,
@@ -1149,31 +1213,38 @@ app.post(
   uploadLogo.single('logo'),
   async (req, res) => {
     try {
-      const merchantId = Number(req.params.merchantId);
-      const logoUrl = `https://92.112.193.171/uploads/logos/${req.file.filename}`;
-      
-      // Mettre à jour en base
-      const result = await query(
-        'UPDATE merchants SET logo_url = $1 WHERE id = $2 RETURNING id, name, logo_url',
-        [logoUrl, merchantId]
-      );
-      
-      if (result.rowCount === 0) {
-        return res.status(404).json({ error: 'Marchand introuvable' });
+      if (!req.file) {
+        return res.status(400).json({ error: 'Aucun fichier uploadé' });
       }
+
+      const logoUrl = `http://92.112.193.171:3002/uploads/logos/${req.file.filename}`;
       
+      // Mettre à jour en BDD
+      const result = await db.query(
+        'UPDATE merchants SET logo_url = $1 WHERE id = $2 RETURNING *',
+        [logoUrl, req.params.merchantId]
+      );
+
+      console.log('[UPLOAD] Logo marchand:', {
+        merchant: req.params.merchantId,
+        filename: req.file.filename,
+        url: logoUrl
+      });
+
       return res.json({ 
         success: true, 
         logo_url: logoUrl,
         merchant: result.rows[0]
       });
-      
     } catch (error) {
-      console.error('Erreur upload logo:', error);
-      return res.status(500).json({ error: 'Erreur serveur' });
+      console.error('[UPLOAD] Erreur:', error);
+      return res.status(500).json({ error: error.message });
     }
   }
 );
+
+// ===== SERVIR LES FICHIERS STATIQUES =====
+app.use('/uploads', express.static('/var/www/uploads'));
 
 // ================================
 // Webhook "test" (Postman)
