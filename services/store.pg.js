@@ -204,55 +204,55 @@ export async function getConversationState(merchantId, customerId) {
      WHERE merchant_id=$1 AND customer_id=$2 LIMIT 1`,
     [merchantId, customerId]
   );
-  // pg retourne jsonb déjà en objet JS
   return res.rows[0]?.state || {};
 }
 
 /**
- * ✅ CORRECTION #1: setConversationState avec suppression des clés null
- * 
- * - Si state = {} => reset complet
- * - Si state contient des clés avec valeur null => supprimer ces clés
- * - Sinon => merge intelligent
+ * ✅ VERSION CORRIGÉE (robuste)
+ *
+ * Règles :
+ * - state = {}  -> reset complet
+ * - patch avec { key: null } -> supprime la clé dans jsonb
+ * - sinon -> merge jsonb côté SQL (sans race condition)
  */
 export async function setConversationState(merchantId, customerId, state) {
   try {
-    const patch = state && typeof state === "object" ? state : {};
-    
+    const input = state && typeof state === "object" ? state : {};
+
     // ✅ Reset complet si objet vide
-    if (Object.keys(patch).length === 0) {
+    if (Object.keys(input).length === 0) {
       const res = await query(
         `INSERT INTO conversation_states (merchant_id, customer_id, state)
          VALUES ($1, $2, '{}'::jsonb)
          ON CONFLICT (merchant_id, customer_id)
-         DO UPDATE SET state = '{}'::jsonb
+         DO UPDATE SET state='{}'::jsonb, updated_at=now()
          RETURNING state`,
         [merchantId, customerId]
       );
       return res.rows[0]?.state || {};
     }
 
-    // ✅ Lire l'état actuel
-    const current = await getConversationState(merchantId, customerId);
-    
-    // ✅ Merge en JS : supprimer les clés null/undefined
-    const merged = { ...current };
-    for (const [key, value] of Object.entries(patch)) {
-      if (value === null || value === undefined) {
-        delete merged[key];
-      } else {
-        merged[key] = value;
-      }
+    // ✅ Construire patch + liste de suppression
+    const patch = {};
+    const deleteKeys = [];
+
+    for (const [k, v] of Object.entries(input)) {
+      if (v === null || v === undefined) deleteKeys.push(k);
+      else patch[k] = v;
     }
 
-    // ✅ Réécrire l'état complet
+    const patchJson = JSON.stringify(patch);
+    const deleteArr = deleteKeys; // toujours un array (peut être vide)
+
     const res = await query(
       `INSERT INTO conversation_states (merchant_id, customer_id, state)
        VALUES ($1, $2, $3::jsonb)
        ON CONFLICT (merchant_id, customer_id)
-       DO UPDATE SET state = EXCLUDED.state
+       DO UPDATE SET
+         state = ((conversation_states.state || $3::jsonb) - $4::text[]),
+         updated_at = now()
        RETURNING state`,
-      [merchantId, customerId, JSON.stringify(merged)]
+      [merchantId, customerId, patchJson, deleteArr]
     );
 
     return res.rows[0]?.state || {};
@@ -271,7 +271,7 @@ export async function setConversationState(merchantId, customerId, state) {
 ========================= */
 
 /**
- * ✅ CORRECTION #2: getCart retourne un objet structuré au lieu d'un array
+ * ✅ getCart retourne un objet structuré
  */
 export async function getCart(merchantId, customerId) {
   const res = await query(
@@ -288,7 +288,6 @@ export async function getCart(merchantId, customerId) {
   const total = items.reduce((sum, item) => sum + Number(item.total_price), 0);
   const currency = items[0]?.currency || "XOF";
 
-  // ✅ Retourner un objet structuré compatible workflow n8n
   return {
     items,
     total_items: items.length,
@@ -298,24 +297,21 @@ export async function getCart(merchantId, customerId) {
 }
 
 /**
- * ✅ CORRECTION #3: Vérifier que le produit est actif avant ajout au panier
+ * ✅ Vérifier que le produit est actif avant ajout au panier
  */
 export async function addToCart(merchantId, customerId, productId, quantity) {
   try {
-    // ✅ Vérifier que le produit existe ET est actif
     const productRes = await query(
-      `SELECT price, currency, is_active, name FROM products 
+      `SELECT price, currency, is_active, name FROM products
        WHERE id=$1 AND merchant_id=$2`,
       [productId, merchantId]
     );
-    
+
     if (productRes.rowCount === 0) {
       throw new Error(`Produit ${productId} introuvable pour marchand ${merchantId}`);
     }
 
     const product = productRes.rows[0];
-    
-    // ✅ Rejeter si produit désactivé
     if (!product.is_active) {
       throw new Error(`Produit "${product.name}" (${productId}) n'est plus disponible`);
     }
@@ -364,25 +360,6 @@ export async function clearCart(merchantId, customerId) {
 /* =========================
    Orders
 ========================= */
-
-/**
- * ✅ CORRECTION #4: Utiliser une transaction pour créer la commande
- * 
- * IMPORTANT: Cette fonction nécessite que votre db.js exporte un pool
- * avec la méthode .connect() pour obtenir un client dédié.
- * 
- * Si votre db.js n'exporte qu'une fonction query(), vous devrez l'adapter.
- */
-// ============================================
-// REMPLACER LA FONCTION createOrderFromCart
-// dans store.pg.js par cette version
-// ============================================
-
-
-/**
- * ✅ VERSION FINALE avec withTransaction (recommandé)
- * Utilise la fonction helper de db.js pour gérer la transaction
- */
 export async function createOrderFromCart(merchantId, customerId, opts = {}) {
   const {
     deliveryRequestedAt = null,
@@ -397,9 +374,7 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
   } = opts;
 
   try {
-    // ✅ Utiliser withTransaction de db.js
     const result = await withTransaction(async (client) => {
-      // 1) lire panier avec lock
       const cartRes = await client.query(
         `SELECT ci.product_id, ci.quantity, ci.unit_price, ci.total_price, p.name
          FROM cart_items ci
@@ -408,7 +383,7 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
          FOR UPDATE`,
         [merchantId, customerId]
       );
-      
+
       if (cartRes.rowCount === 0) {
         throw new Error("Panier vide");
       }
@@ -417,18 +392,16 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
       const totalAmount = items.reduce((sum, it) => sum + Number(it.total_price), 0);
       const currency = "XOF";
 
-      // 2) snapshot infos client
       const customerRes = await client.query(
         `SELECT address, payment_method FROM customers
          WHERE id=$1 AND merchant_id=$2`,
         [customerId, merchantId]
       );
-      
+
       const customerRow = customerRes.rows[0] || {};
       const deliveryAddress = customerRow.address || null;
       const paymentMethodSnapshot = customerRow.payment_method || null;
 
-      // 3) créer la commande
       const orderRes = await client.query(
         `INSERT INTO orders (
             merchant_id, customer_id,
@@ -459,7 +432,6 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
 
       const order = orderRes.rows[0];
 
-      // 4) copier order_items
       const values = [];
       const params = [order.id];
 
@@ -475,20 +447,16 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
         params
       );
 
-      // 5) vider panier
       await client.query(
         `DELETE FROM cart_items WHERE merchant_id=$1 AND customer_id=$2`,
         [merchantId, customerId]
       );
 
-      // ✅ Retourner les données (le COMMIT sera fait automatiquement)
       return { order, items };
     });
 
     console.log(`[store.pg] ✅ Commande créée: order_id=${result.order.id}, merchant=${merchantId}, customer=${customerId}`);
-    
     return result;
-    
   } catch (error) {
     console.error(`[store.pg] ❌ createOrderFromCart error (transaction rolled back):`, {
       merchantId,
@@ -499,6 +467,7 @@ export async function createOrderFromCart(merchantId, customerId, opts = {}) {
     throw error;
   }
 }
+
 export async function getOrdersForMerchant(merchantId) {
   const res = await query(
     `SELECT o.id, o.merchant_id, o.customer_id, o.total_amount, o.currency, o.status, o.created_at,
@@ -561,8 +530,11 @@ export async function getOrderWithItems(merchantId, orderId) {
   };
 }
 
+/**
+ * ✅ FIX: autoriser "NEW" (car server.js crée status="NEW")
+ */
 export async function updateOrderStatus(merchantId, orderId, status) {
-  const allowed = ["PENDING", "CONFIRMED", "DELIVERED", "CANCELED"];
+  const allowed = ["NEW", "PENDING", "CONFIRMED", "DELIVERED", "CANCELED"];
   if (!allowed.includes(status)) throw new Error(`Statut invalide: ${status}`);
 
   const res = await query(
@@ -575,18 +547,13 @@ export async function updateOrderStatus(merchantId, orderId, status) {
 /* =========================
    Customer fields
 ========================= */
-
-/**
- * ✅ CORRECTION #5: Sécuriser contre SQL injection avec mapping strict
- */
 export async function updateCustomerField(merchantId, customerId, field, value) {
-  // ✅ Mapping strict pour éviter SQL injection
   const allowedFields = {
     name: "name",
     address: "address",
-    payment_method: "payment_method"
+    payment_method: "payment_method",
   };
-  
+
   const safeField = allowedFields[field];
   if (!safeField) {
     throw new Error(`Champ non autorisé: ${field}`);
@@ -676,10 +643,8 @@ export async function loadLastOrderToCart(merchantId, customerId) {
     return { blocked: true, reason: `Commande non modifiable (status=${st})`, order: last.order };
   }
 
-  // vider panier actuel
   await clearCart(merchantId, customerId);
 
-  // réinjecter items dans cart_items
   for (const it of last.items) {
     await query(
       `INSERT INTO cart_items (merchant_id, customer_id, product_id, quantity, unit_price, total_price)
