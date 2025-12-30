@@ -1,8 +1,6 @@
-// server.js (corrigé) ✅
-// Objectif UX : le mot "CONFIRMER" n’apparaît qu’UNE SEULE fois (à la fin).
-// - Le bot collecte les infos manquantes
-// - Puis envoie un récap + "Réponds CONFIRMER"
-// - Si le client répond CONFIRMER => création commande
+// server.js (COMPLET - CORRIGÉ ✅)
+// Version: 2025-12-30
+// Corrections: PDF timeout, gestion erreur robuste, logs détaillés
 
 import cors from "cors";
 import express from "express";
@@ -62,9 +60,12 @@ app.use(bodyParser.json({ limit: "5mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-a-changer";
 
-// Admin credentials (prod conseillé)
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // ex: admin@dido.com
-const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // bcrypt hash
+// Admin credentials
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
+
+// Cache PDF (optionnel)
+const pdfCache = new Map(); // merchantId -> { path, timestamp }
 
 // ================================
 // Helpers (Validation & Anti-ACK)
@@ -224,7 +225,7 @@ function normalizeE164(input) {
 }
 
 // ================================
-// Confirmation UX (UNE SEULE FOIS)
+// Confirmation UX
 // ================================
 const CONFIRM_WORDS = [
   "confirmer",
@@ -256,11 +257,11 @@ function isCancelIntent(text) {
 
 function questionFor(field) {
   const q = {
-    recipient_mode: "Pour finaliser : c’est pour vous-même (1) ou pour une autre personne (2) ?",
+    recipient_mode: "Pour finaliser : c'est pour vous-même (1) ou pour une autre personne (2) ?",
     name: "Quel est votre *nom complet* ? (ex : KONE Aïcha)",
     recipient_name: "Donne-moi le *nom complet* du destinataire. (ex : KONE Aïcha)",
     recipient_phone: "Donne-moi le *numéro WhatsApp* du destinataire. (ex : 225XXXXXXXXXX)",
-    recipient_address: "Quelle est l’*adresse complète* du destinataire ? (ex : Cocody Angré 8e tranche…)",
+    recipient_address: "Quelle est l'*adresse complète* du destinataire ? (ex : Cocody Angré 8e tranche…)",
     payment_method: "Quel mode de paiement souhaitez-vous ? (*cash*, *Wave*, *Orange Money*, *MTN*, *carte*)",
     delivery_requested_raw: "Donne la *date/heure de livraison* (ex : 31/12/2025 à 13h ou 2025-12-31 13:00).",
   };
@@ -282,7 +283,7 @@ function formatCartSummary(cart) {
 }
 
 // ================================
-// Parse date livraison (corrigé + support "31/12/2025 à 13h")
+// Parse date livraison
 // ================================
 function parseDeliveryRequestedAt(rawText) {
   if (!rawText) return null;
@@ -335,33 +336,18 @@ function parseDeliveryRequestedAt(rawText) {
 
   // Jour + mois
   const monthNames = {
-    janvier: 0,
-    jan: 0,
-    "février": 1,
-    fevrier: 1,
-    fev: 1,
-    "fév": 1,
-    mars: 2,
-    mar: 2,
-    avril: 3,
-    avr: 3,
+    janvier: 0, jan: 0,
+    "février": 1, fevrier: 1, fev: 1, "fév": 1,
+    mars: 2, mar: 2,
+    avril: 3, avr: 3,
     mai: 4,
     juin: 5,
-    juillet: 6,
-    juil: 6,
-    août: 7,
-    aout: 7,
-    septembre: 8,
-    sept: 8,
-    sep: 8,
-    octobre: 9,
-    oct: 9,
-    novembre: 10,
-    nov: 10,
-    décembre: 11,
-    decembre: 11,
-    dec: 11,
-    "déc": 11,
+    juillet: 6, juil: 6,
+    août: 7, aout: 7,
+    septembre: 8, sept: 8, sep: 8,
+    octobre: 9, oct: 9,
+    novembre: 10, nov: 10,
+    décembre: 11, decembre: 11, dec: 11, "déc": 11,
   };
 
   const dayMonthMatch = s.match(
@@ -577,7 +563,7 @@ function adminAuthMiddleware(req, res, next) {
 }
 
 // ================================
-// Structured replies (sans IA) - CORRIGÉ
+// Structured replies (sans IA)
 // ================================
 function looksLikeRecipientSelf(msg) {
   const s = normText(msg);
@@ -619,7 +605,6 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
     return { handled: true, message: "Je n'arrive pas à comprendre cette information. Un conseiller va te recontacter 🙂" };
   }
 
-  // Si ACK => on redemande la vraie valeur
   const fieldsRequiringValue = ["name", "recipient_name", "recipient_address", "recipient_phone", "delivery_requested_raw", "payment_method"];
 
   if (isAckValue(clean) && fieldsRequiringValue.includes(waiting)) {
@@ -661,7 +646,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
   if (waiting === "name" || waiting === "self_name") {
     if (!validateField("name", clean)) {
       await setConversationState(merchant.id, customer.id, { ...conversationState, loop_guard: { key: currentKey, count } });
-      return { handled: true, message: "J’ai besoin de votre *nom complet* (ex : KONE Aïcha)." };
+      return { handled: true, message: "J'ai besoin de votre *nom complet* (ex : KONE Aïcha)." };
     }
 
     await updateCustomerField(merchant.id, customer.id, "name", clean);
@@ -713,7 +698,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
   if (waiting === "recipient_name") {
     if (!validateField("recipient_name", clean)) {
       await setConversationState(merchant.id, customer.id, { ...conversationState, loop_guard: { key: currentKey, count } });
-      return { handled: true, message: "J’ai besoin du *nom complet* du destinataire (ex : KONE Aïcha)." };
+      return { handled: true, message: "J'ai besoin du *nom complet* du destinataire (ex : KONE Aïcha)." };
     }
     const st0 = await getConversationState(merchant.id, customer.id);
     const st = { ...(st0 || {}), recipient_name: clean, loop_guard: null };
@@ -742,7 +727,7 @@ async function tryHandleStructuredReply({ merchant, customer, text, conversation
   if (waiting === "recipient_address") {
     if (!validateField("recipient_address", clean)) {
       await setConversationState(merchant.id, customer.id, { ...conversationState, loop_guard: { key: currentKey, count } });
-      return { handled: true, message: "J’ai besoin d’une *adresse complète* (ex : Cocody Angré 8e tranche…)." };
+      return { handled: true, message: "J'ai besoin d'une *adresse complète* (ex : Cocody Angré 8e tranche…)." };
     }
     const st0 = await getConversationState(merchant.id, customer.id);
     const st = { ...(st0 || {}), recipient_address: clean, loop_guard: null };
@@ -762,7 +747,7 @@ app.get("/", (req, res) => {
 });
 
 // ================================
-// Actions IA (CORRIGÉ - confirmation 1 seule fois)
+// Actions IA
 // ================================
 async function applyAction(action, ctx) {
   const { merchant, customer } = ctx;
@@ -838,7 +823,6 @@ async function applyAction(action, ctx) {
     case "CONFIRM_ORDER": {
       const st = await getConversationState(merchant.id, customer.id);
 
-      // 1) vérifier si infos manquantes
       const nextMissing = computeNextMissingField(customer, st);
       if (nextMissing) {
         await setConversationState(merchant.id, customer.id, {
@@ -851,7 +835,6 @@ async function applyAction(action, ctx) {
         return;
       }
 
-      // 2) si pas encore demandé CONFIRMER => on envoie le récap UNE SEULE fois
       if (!st?.awaiting_confirmation) {
         await setConversationState(merchant.id, customer.id, {
           ...(st || {}),
@@ -863,7 +846,6 @@ async function applyAction(action, ctx) {
         return;
       }
 
-      // 3) création commande (puis reset)
       let deliveryAt = null;
       if (st?.delivery_requested_at) deliveryAt = new Date(st.delivery_requested_at);
       if (!deliveryAt || Number.isNaN(deliveryAt.getTime())) deliveryAt = parseDeliveryRequestedAt(st?.delivery_requested_raw);
@@ -881,7 +863,6 @@ async function applyAction(action, ctx) {
         return;
       }
 
-      // self
       if (st.recipient_mode === "self") {
         await createOrderFromCart(merchant.id, customer.id, {
           recipientCustomerId: customer.id,
@@ -913,7 +894,6 @@ async function applyAction(action, ctx) {
         return;
       }
 
-      // third party
       if (st.recipient_mode === "third_party") {
         const recipientPhone = normalizeE164(st.recipient_phone);
         const recipient = await findOrCreateCustomer(merchant.id, recipientPhone);
@@ -951,7 +931,6 @@ async function applyAction(action, ctx) {
         return;
       }
 
-      // fallback
       await setConversationState(merchant.id, customer.id, { ...(st || {}), step: "ASKING_INFO", waiting_field: "recipient_mode" });
       ctx.overrideMessage = questionFor("recipient_mode");
       return;
@@ -964,18 +943,18 @@ async function applyAction(action, ctx) {
 }
 
 // ================================
-// Moteur commun (utilisé par WAHA + Postman)
+// Moteur commun (WAHA + Postman)
 // ================================
 async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
   const customer = await findOrCreateCustomer(merchant.id, from);
   const conversationState = await getConversationState(merchant.id, customer.id);
 
-  // Silence si opt-out déjà activé (sauf réactivation)
+  // Silence si opt-out
   if (conversationState?.opted_out && !isReactivationMessage(text)) {
     return { message: null, actions: [] };
   }
 
-  // Si on attend CONFIRMER et l’utilisateur annule
+  // Annulation pendant AWAITING_CONFIRMATION
   if (conversationState?.awaiting_confirmation && isCancelIntent(text)) {
     await clearCart(merchant.id, customer.id);
     await setConversationState(merchant.id, customer.id, {
@@ -993,12 +972,12 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
       loop_guard: null,
     });
 
-    const msg = "✅ D’accord, j’ai annulé la validation. Ton panier est vidé. Tape *1* pour revoir les produits.";
+    const msg = "✅ D'accord, j'ai annulé la validation. Ton panier est vidé. Tape *1* pour revoir les produits.";
     await sendWhatsappMessage({ merchant, chatId: replyChatId, to: from, text: msg });
     return { message: msg, actions: [] };
   }
 
-  // Si on attend CONFIRMER et l’utilisateur confirme => on crée la commande DIRECT (sans IA)
+  // Confirmation pendant AWAITING_CONFIRMATION
   if (conversationState?.awaiting_confirmation && isConfirmIntent(text)) {
     const ctx = { merchant, customer, overrideMessage: null };
     await applyAction({ type: "CONFIRM_ORDER" }, ctx);
@@ -1008,7 +987,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
     return { message: ctx.overrideMessage || null, actions: [{ type: "CONFIRM_ORDER" }] };
   }
 
-  // 1) Réponses structurées (sans IA)
+  // Réponses structurées
   const structured = await tryHandleStructuredReply({ merchant, customer, text, conversationState });
   if (structured.handled) {
     if (structured.message) {
@@ -1022,7 +1001,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
     return { message: structured.message || null, actions: [] };
   }
 
-  // ===== PDF catalogue =====
+  // ===== PDF CATALOGUE (CORRIGÉ AVEC TIMEOUT) =====
   const normalizedText = text.toLowerCase().trim();
   const isPdfRequest =
     normalizedText.includes("avec images") ||
@@ -1032,14 +1011,25 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
     normalizedText === "images";
 
   if (isPdfRequest) {
+    console.log("[Catalog] 📄 Demande PDF détectée pour merchant:", merchant.id);
+    
     try {
       const products = await getProductsForMerchant(merchant.id);
 
       if (products.length === 0) {
-        await sendWhatsappMessage({ merchant, chatId: replyChatId, to: from, text: "Désolé, aucun produit n'est disponible pour le moment." });
+        console.log("[Catalog] ⚠️ Aucun produit disponible pour merchant:", merchant.id);
+        await sendWhatsappMessage({
+          merchant,
+          chatId: replyChatId,
+          to: from,
+          text: "Désolé, aucun produit n'est disponible pour le moment.",
+        });
         return { message: "Aucun produit disponible", actions: [] };
       }
 
+      console.log(`[Catalog] 📦 ${products.length} produits trouvés, génération en cours...`);
+
+      // Message initial
       await sendWhatsappMessage({
         merchant,
         chatId: replyChatId,
@@ -1047,33 +1037,142 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
         text: "🔄 Génération du catalogue PDF en cours (quelques secondes)...",
       });
 
-      const pdfPath = await generateCatalogPDF(merchant, products);
+      // ✅ VÉRIFIER LE CACHE (1 heure)
+      const cacheKey = `catalog_${merchant.id}`;
+      const cached = pdfCache.get(cacheKey);
 
-      await sendWhatsappDocument({
-        merchant,
-        chatId: replyChatId,
-        to: from,
-        filePath: pdfPath,
-        filename: `Catalogue_${merchant.name.replace(/\s+/g, "_")}.pdf`,
-        caption: `📦 Catalogue complet (${products.length} produits)\n\n✅ Pour commander, tapez le nom ou le code du produit`,
+      if (cached && Date.now() - cached.timestamp < 3600000 && fs.existsSync(cached.path)) {
+        console.log("[Catalog] 📦 Utilisation du cache PDF");
+        
+        try {
+          await sendWhatsappDocument({
+            merchant,
+            chatId: replyChatId,
+            to: from,
+            filePath: cached.path,
+            filename: `Catalogue_${merchant.name.replace(/\s+/g, "_")}.pdf`,
+            caption: `📦 Catalogue complet (${products.length} produits)\n\n✅ Pour commander, tapez le nom ou le code du produit`,
+          });
+          
+          console.log("[Catalog] ✅ PDF envoyé depuis le cache");
+          return { message: "Catalogue PDF envoyé (cache)", actions: [] };
+        } catch (sendError) {
+          console.error("[Catalog] ❌ Erreur envoi cache:", sendError);
+          // Si l'envoi échoue, on continue avec une nouvelle génération
+        }
+      }
+
+      // ✅ GÉNÉRATION AVEC TIMEOUT DE 30 SECONDES
+      let pdfPath = null;
+      
+      const pdfPromise = generateCatalogPDF(merchant, products);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Timeout: génération PDF > 30s")), 30000)
+      );
+
+      try {
+        pdfPath = await Promise.race([pdfPromise, timeoutPromise]);
+        console.log("[Catalog] ✅ PDF généré avec succès:", pdfPath);
+      } catch (timeoutError) {
+        console.error("[Catalog] ⏱️ TIMEOUT génération PDF:", timeoutError.message);
+        throw new Error("La génération du PDF a pris trop de temps");
+      }
+
+      // ✅ VÉRIFIER QUE LE FICHIER EXISTE
+      if (!pdfPath || !fs.existsSync(pdfPath)) {
+        console.error("[Catalog] ❌ Fichier PDF introuvable:", pdfPath);
+        throw new Error("Le fichier PDF n'a pas été créé");
+      }
+
+      const stats = fs.statSync(pdfPath);
+      console.log(`[Catalog] 📊 Taille PDF: ${(stats.size / 1024).toFixed(2)} KB`);
+
+      // ✅ VÉRIFIER LA TAILLE (max 10MB pour WhatsApp)
+      if (stats.size > 10 * 1024 * 1024) {
+        console.error("[Catalog] ❌ PDF trop volumineux:", stats.size);
+        
+        try {
+          fs.unlinkSync(pdfPath);
+        } catch (cleanupErr) {
+          console.error("[Catalog] ⚠️ Erreur cleanup PDF volumineux:", cleanupErr);
+        }
+        
+        await sendWhatsappMessage({
+          merchant,
+          chatId: replyChatId,
+          to: from,
+          text: `❌ Le catalogue est trop volumineux (${products.length} produits).\n\nTapez 1 pour voir la liste texte ou contactez-nous.`,
+        });
+        return { message: "PDF trop volumineux", actions: [] };
+      }
+
+      // ✅ ENVOYER LE PDF AVEC GESTION D'ERREUR
+      console.log("[Catalog] 📤 Envoi du PDF via WhatsApp...");
+      
+      try {
+        await sendWhatsappDocument({
+          merchant,
+          chatId: replyChatId,
+          to: from,
+          filePath: pdfPath,
+          filename: `Catalogue_${merchant.name.replace(/\s+/g, "_")}.pdf`,
+          caption: `📦 Catalogue complet (${products.length} produits)\n\n✅ Pour commander, tapez le nom ou le code du produit`,
+        });
+        
+        console.log("[Catalog] ✅ PDF envoyé avec succès");
+        
+        // ✅ SAUVEGARDER DANS LE CACHE
+        pdfCache.set(cacheKey, {
+          path: pdfPath,
+          timestamp: Date.now(),
+        });
+        
+      } catch (sendError) {
+        console.error("[Catalog] ❌ Erreur envoi WhatsApp:", sendError);
+        throw new Error("Impossible d'envoyer le PDF via WhatsApp");
+      }
+
+      // ✅ CLEANUP SÉCURISÉ AVEC DELAY (seulement si pas en cache)
+      if (!cached || cached.path !== pdfPath) {
+        setTimeout(() => {
+          try {
+            if (pdfPath && fs.existsSync(pdfPath)) {
+              cleanupPDF(pdfPath);
+              console.log("[Catalog] 🗑️ PDF nettoyé:", pdfPath);
+            }
+          } catch (cleanupErr) {
+            console.error("[Catalog] ⚠️ Erreur cleanup (non bloquant):", cleanupErr.message);
+          }
+        }, 15000);
+      }
+
+      return { message: "Catalogue PDF envoyé", actions: [] };
+      
+    } catch (error) {
+      console.error("[Catalog] ❌ ERREUR GÉNÉRALE PDF:", {
+        error: error.message,
+        stack: error.stack,
+        merchant: merchant.id,
+        from: from,
       });
 
-      setTimeout(() => cleanupPDF(pdfPath), 10000);
-      return { message: "Catalogue PDF envoyé", actions: [] };
-    } catch (error) {
-      console.error("[Catalog] ❌ Erreur génération PDF:", error);
+      const errorMsg =
+        error.message.includes("Timeout") || error.message.includes("trop de temps")
+          ? "❌ La génération du catalogue prend trop de temps. Réessayez dans quelques instants ou tapez 1 pour la liste."
+          : error.message.includes("trop volumineux")
+          ? "❌ Le catalogue est trop volumineux. Tapez 1 pour voir la liste texte."
+          : "❌ Erreur lors de la génération du catalogue. Veuillez réessayer ou tapez 1 pour voir la liste.";
+
       await sendWhatsappMessage({
         merchant,
         chatId: replyChatId,
         to: from,
-        text: "❌ Erreur lors de la génération du catalogue. Veuillez réessayer ou tapez 1 pour voir la liste.",
+        text: errorMsg,
       });
+
       return { message: "Erreur PDF", actions: [] };
     }
   }
-
-  // Si on est en attente CONFIRMER mais le client envoie autre chose, on ne spam pas.
-  // (Optionnel) on peut guider une seule fois si besoin, ici on laisse l'IA gérer.
 
   // Récupérer panier + produits
   const cart = await getCart(merchant.id, customer.id);
@@ -1124,7 +1223,7 @@ async function handleIncomingMessage({ from, text, merchant, replyChatId }) {
 }
 
 // ================================
-// Configuration Upload (Images produits + Logos)
+// Configuration Upload
 // ================================
 const productsUploadDir = "/var/www/uploads/products";
 const logosUploadDir = "/var/www/uploads/logos";
@@ -1174,7 +1273,6 @@ const uploadLogo = multer({
 
 app.use("/uploads", express.static("/var/www/uploads"));
 
-// Upload image produit
 app.post(
   "/api/merchants/:merchantId/upload-product-image",
   authMiddleware,
@@ -1200,7 +1298,6 @@ app.post(
   }
 );
 
-// Upload logo marchand
 app.post("/api/merchants/:merchantId/logo", authMiddleware, requireSameMerchant, uploadLogo.single("logo"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Aucun fichier uploadé" });
@@ -1227,7 +1324,7 @@ app.post("/api/merchants/:merchantId/logo", authMiddleware, requireSameMerchant,
 });
 
 // ================================
-// Webhook "test" (Postman)
+// Webhook test (Postman)
 // ================================
 app.post("/webhook/whatsapp", async (req, res) => {
   try {
@@ -1308,7 +1405,7 @@ app.post("/webhook/waha", async (req, res) => {
 });
 
 // ================================
-// Merchant Auth (login/register)
+// Merchant Auth
 // ================================
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -1359,7 +1456,7 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 // ================================
-// Merchant API (products/orders) - protégée
+// Merchant API (products/orders)
 // ================================
 app.get("/api/merchants/:merchantId/products", authMiddleware, requireSameMerchant, subscriptionGate, async (req, res) => {
   try {
@@ -1615,9 +1712,33 @@ app.put("/api/admin/merchants/:merchantId/waha", adminAuthMiddleware, async (req
 });
 
 // ================================
+// Monitoring endpoint (optionnel)
+// ================================
+app.get("/api/admin/pdf-stats", adminAuthMiddleware, async (req, res) => {
+  try {
+    const stats = {
+      cache_size: pdfCache.size,
+      cached_merchants: Array.from(pdfCache.keys()),
+      cache_details: Array.from(pdfCache.entries()).map(([merchantId, data]) => ({
+        merchant_id: merchantId,
+        cached_at: new Date(data.timestamp).toISOString(),
+        age_minutes: Math.floor((Date.now() - data.timestamp) / 60000),
+        file_exists: fs.existsSync(data.path),
+      })),
+    };
+    
+    return res.json(stats);
+  } catch (e) {
+    return res.status(500).json({ error: "Erreur stats" });
+  }
+});
+
+// ================================
 // Start server
 // ================================
 const listenPort = Number(process.env.PORT || PORT || 3000);
 app.listen(listenPort, "0.0.0.0", () => {
   console.log("✅ Serveur démarré sur le port", listenPort);
+  console.log("📄 Génération PDF avec cache activé (1h)");
+  console.log("⏱️ Timeout PDF: 30 secondes");
 });

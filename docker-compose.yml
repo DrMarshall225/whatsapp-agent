@@ -25,10 +25,28 @@ services:
     
     ports:
       - "3002:3000/tcp"
-    networks:
-      - appnet
+    
+ 
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=root_default"
+      - "traefik.http.routers.api-maboutiki.rule=Host(`api.maboutiki.com`)"
+      - "traefik.http.routers.api-maboutiki.tls=true"
+      - "traefik.http.routers.api-maboutiki.entrypoints=web,websecure"
+      - "traefik.http.routers.api-maboutiki.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.api-maboutiki.loadbalancer.server.port=3000"
+      # CORS headers
+      - "traefik.http.middlewares.api-cors.headers.accesscontrolallowmethods=GET,POST,PUT,DELETE,OPTIONS"
+      - "traefik.http.middlewares.api-cors.headers.accesscontrolalloworiginlist=*"
+      - "traefik.http.middlewares.api-cors.headers.accesscontrolallowheaders=Content-Type,Authorization"
+      - "traefik.http.middlewares.api-cors.headers.accesscontrolmaxage=100"
+      - "traefik.http.middlewares.api-cors.headers.addvaryheader=true"
+      - "traefik.http.routers.api-maboutiki.middlewares=api-cors@docker"
 
 networks:
   appnet:
     external: true
     name: appnet
+  root_default:
+    external: true
+    name: root_default
